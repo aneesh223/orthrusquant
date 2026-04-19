@@ -36,8 +36,14 @@ def _get_model():
     """
     global _model, _device
     if _model is None:
-        # Detect device: use CUDA if available, otherwise CPU
-        _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Detect device: use CUDA if available, otherwise CPU or MPS
+        if torch.cuda.is_available():
+            _device = torch.device("cuda")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            _device = torch.device("mps")
+        else:
+            _device = torch.device("cpu")
+            
         logger.info(f"Initializing OrderBookCNN on device: {_device}")
         
         # Initialize model and move to device

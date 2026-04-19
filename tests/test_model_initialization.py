@@ -34,9 +34,9 @@ def test_get_model_returns_model_and_device():
     assert isinstance(device, torch.device), \
         "Device should be a torch.device instance"
     
-    # Verify device is either cuda or cpu
-    assert device.type in ['cuda', 'cpu'], \
-        "Device type should be either 'cuda' or 'cpu'"
+    # Verify device is either cuda, mps, or cpu
+    assert device.type in ['cuda', 'mps', 'cpu'], \
+        "Device type should be 'cuda', 'mps', or 'cpu'"
     
     # Verify model is in eval mode
     assert not model.training, \

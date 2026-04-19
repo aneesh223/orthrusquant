@@ -39,11 +39,16 @@ def _ensure_model():
             _ai_tokenizer = AutoTokenizer.from_pretrained(model_name)
             _ai_model = AutoModelForSequenceClassification.from_pretrained(model_name)
             
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            if device.type == "cuda":
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
                 _ai_model = _ai_model.to(device)
                 logging.info(f"DistilRoBERTa loaded on GPU: {torch.cuda.get_device_name(0)}")
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = torch.device("mps")
+                _ai_model = _ai_model.to(device)
+                logging.info("DistilRoBERTa loaded on Apple Silicon GPU (MPS)")
             else:
+                device = torch.device("cpu")
                 logging.info("DistilRoBERTa loaded on CPU")
             
             _ai_model.eval()
@@ -173,7 +178,13 @@ def get_hybrid_sentiment(text, ticker=""):
             inputs = ai_tokenizer(cleaned_text, return_tensors="pt", truncation=True, padding=True, max_length=512)
             
             # Move to GPU if available
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+                
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
             with torch.no_grad():
@@ -255,11 +266,16 @@ def get_hybrid_sentiment_batch(texts, ticker="", batch_size=32):
     try:
         import torch
         
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if device.type == "cuda":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
             ai_model = ai_model.to(device)
             logging.info(f"Using GPU acceleration: {torch.cuda.get_device_name(0)}")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = torch.device("mps")
+            ai_model = ai_model.to(device)
+            logging.info("Using Apple Silicon GPU acceleration (MPS)")
         else:
+            device = torch.device("cpu")
             logging.info("Using CPU processing")
         
         results = []
@@ -329,8 +345,7 @@ def get_hybrid_sentiment_batch(texts, ticker="", batch_size=32):
                 
                 results.append(hybrid_score)
             
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+            # Removed torch.cuda.empty_cache() to prevent allocator thrashing
         
         _batch_cache[batch_cache_key] = results
         _cache_misses += len(texts)

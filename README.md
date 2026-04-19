@@ -562,10 +562,10 @@ python backtester/examples.py
 
 ## Requirements
 
-- Python 3.8+
+- **Python 3.8 to 3.12** (⚠️ **Do not use Python 3.13+** as PyTorch does not yet have official CUDA/MPS acceleration binaries for newer versions).
 - Internet connection for real-time data
 - Alpaca API keys for news and historical data
-- Optional: CUDA-compatible GPU for faster sentiment analysis and CNN inference
+- **Optional (but recommended):** GPU Hardware Acceleration (NVIDIA CUDA or Apple Silicon MPS) is fully supported natively for high-speed sentiment analysis and CNN inference.
 - See `requirements.txt` for complete dependency list
 
 ## Dependencies
