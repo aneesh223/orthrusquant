@@ -1,10 +1,11 @@
 """
-Convolutional Order Book - Vision Engine Module
+Convolutional Order Book - experimental, untrained vision module.
 
-This module implements CNN-based market microstructure analysis using liquidity heatmaps.
-It converts 1-minute OHLCV data into 2D representations and uses a Convolutional Neural
-Network to detect patterns such as liquidity voids, accumulation zones, and microstructure
-volatility.
+This module defines a small CNN over a 64x64 liquidity heatmap built from
+1-minute OHLCV bars. There is no training code in this repository. Weights
+would be loaded from ``models/orderbook_cnn.pt``, which is gitignored. When
+that file is absent, ``analyze_liquidity`` returns a neutral anomaly score of
+0.5 and does not detect liquidity voids or accumulation zones.
 """
 
 import torch

@@ -4,19 +4,19 @@
 
 ## What Makes Orthrus Special
 
-- **Hybrid AI Sentiment Analysis (Hence the Name)**: Combines VADER + DistilRoBERTa for superior financial news interpretation
+- **Hybrid AI Sentiment Analysis (Hence the Name)**: Combines VADER with a financial DistilRoBERTa classifier
 - **Adaptive Market Regime Detection**: Automatically adjusts strategy based on BULL/BEAR/SIDEWAYS market conditions  
 - **Comprehensive Testing Framework**: Extensive backtesting across multiple market scenarios and timeframes
 - **Advanced Risk Management**: Dynamic stop-loss, take-profit, and volatility protection systems
-- **Production-Ready**: Professional-grade backtesting system with fair performance comparisons
+- **Research backtester**: Historical simulation with explicit costs, a buy-and-hold and optional SPY benchmark, and checks against look-ahead in prices and news
 
 ## Features
 
-### Convolutional Order Book - Vision Engine
+### Convolutional Order Book - Vision Engine (experimental, untrained)
+The CNN is a sketch, not a trained model. Weights would live at `models/orderbook_cnn.pt`, which is gitignored, and this repo has no training code. With no weights, `analyze_liquidity` returns a neutral anomaly score of **0.5** and does not detect liquidity voids or accumulation. The architecture below is what the code would run if weights were supplied.
 - **CNN-Based Microstructure Analysis**: Converts 1-minute OHLCV data into 64x64 liquidity heatmaps
-- **Pattern Detection**: Identifies liquidity voids, accumulation zones, and microstructure volatility
-- **Real-Time Analysis**: Processes intraday data to detect market anomalies
-- **Anomaly Scoring**: 0.0-1.0 scale with interpretable thresholds:
+- **Intended patterns** (only meaningful with trained weights): liquidity voids, accumulation zones, and microstructure volatility
+- **Anomaly Scoring**: 0.0-1.0 scale. Untrained output stays at 0.5. The thresholds below describe the intended scale, not measured accuracy:
   - **> 0.85**: Critical liquidity void detected (dangerous conditions)
   - **0.70-0.85**: High microstructure volatility (risky)
   - **0.20-0.70**: Normal market conditions
@@ -28,7 +28,7 @@
 - **VALUE Strategy**: Rolling window Final_Buy_Score analysis for identifying statistically oversold opportunities
 - **MOMENTUM Strategy**: MACD/RSI combination with Golden Cross/Death Cross detection for swing trading and trend following
 
-### Revolutionary Hybrid Sentiment Analysis
+### Hybrid Sentiment Analysis
 - **Hybrid AI System**: Combines VADER's nuanced scoring (-1 to +1) with DistilRoBERTa's financial accuracy
 - **Enhanced Financial Lexicon**: 40+ custom financial terms (crash: -3.0, soar: +3.0, beat: +2.5, etc.)
 - **Smart Disagreement Resolution**: When models disagree, uses confidence-weighted correction
@@ -58,11 +58,11 @@
 - **Market Regime Detection**: Automatic BULL/BEAR/SIDEWAYS market identification
 - **Adaptive Thresholds**: Dynamic buy/sell thresholds that adjust to market conditions
 - **Risk Management**: Regime-specific stop-loss and take-profit recommendations
-- **Backtester-Proven Logic**: Uses the same algorithms validated in historical testing
+- **Shared logic**: The live view and the backtester call the same signal code. That is a consistency choice, not evidence the strategy makes money.
 
 ### Comprehensive Backtesting System
 - **Historical Analysis**: Test strategies against years of Alpaca market data
-- **Realistic Simulation**: Day-by-day execution with no look-ahead bias
+- **Point-in-time simulation**: Technicals use only bars up to that session, news is aggregated oldest-first, and orders fill at the next open. Sentiment coverage is reported because days with no article still fall back to a neutral score.
 - **Advanced Risk Management**: Adaptive stop-loss, take-profit, and trailing stops based on market regime
 - **Market Regime Detection**: Automatic adaptation to BULL/BEAR/SIDEWAYS markets with volatility tolerance
 - **Performance Analytics**: Fair buy-and-hold comparison (always starts Day 1) with alpha calculation
@@ -130,7 +130,7 @@ The system uses a unified logic module (`src/logic.py`) that ensures consistency
 
 - **Single Source of Truth**: All trading algorithms are centralized in one module
 - **Automatic Synchronization**: Changes to logic automatically apply to both systems
-- **Proven Algorithms**: Logic is validated through extensive backtesting before deployment
+- **Shared algorithms**: The same functions feed the live view and the backtester. Backtests are a check on the implementation, not a claim of a durable edge.
 - **Maintainable Code**: No duplication of complex trading algorithms
 
 ### Time-Series Algorithm Architecture
@@ -156,7 +156,7 @@ The system uses a sophisticated rolling window approach:
    - **Volatility Override**: Extreme volatility protection with bull market tolerance
 
 ### Hybrid Sentiment Analysis System
-The revolutionary hybrid approach combines two complementary AI models:
+The hybrid approach combines two sentiment models:
 
 1. **VADER (Valence Aware Dictionary and sEntiment Reasoner)**:
    - Provides nuanced scoring from -1.0 to +1.0
@@ -407,7 +407,7 @@ python backtester/examples.py
 
 ### Convolutional Order Book Usage
 
-The CNN-based microstructure analysis is **automatically integrated** into the trading recommendation system. It runs in real-time during analysis and adjusts confidence levels based on market microstructure conditions.
+The CNN hook is wired into the recommendation path, but the network ships **untrained**. Until `models/orderbook_cnn.pt` exists, the call returns a neutral 0.5 and the confidence adjustments below do not see a real microstructure signal. Do not treat the thresholds as validated.
 
 **Automatic Integration:**
 ```python
@@ -492,7 +492,7 @@ print(f"Confidence: {result['confidence']}")
 - **Capability**: Test strategies against historical Alpaca data with realistic simulation
 - **Features**:
   - Real Alpaca market data integration (11+ years of data back to 2014)
-  - Day-by-day simulation with no look-ahead bias
+  - Day-by-day simulation: indicators stop at the current session, news is ordered oldest-first, and fills happen at the next open
   - Pre-calculated B(t) and Final_Buy_Score for maximum efficiency
   - Advanced adaptive risk management with market regime detection
   - Bull market volatility tolerance system for enhanced participation
@@ -549,7 +549,7 @@ python backtester/examples.py
 - **Validation**: Test multiple tickers to validate strategy robustness across sectors
 - **Market Conditions**: Longer periods automatically capture different market regimes (bull/bear/sideways)
 - **Capital Testing**: Try different starting amounts to test scalability
-- **Batch Testing**: Use `--optimal-periods` flag for production validation, default mode for diversity testing
+- **Batch Testing**: `--optimal-periods` uses the long windows; the default samples shorter windows for variety. Neither mode is a production validation.
 
 ### Performance Optimization
 - **Efficient Data Processing**: All sentiment analysis done once at startup with parallel API calls
@@ -587,7 +587,7 @@ python backtester/examples.py
 - `tokenizers>=0.13.0` - Text tokenization for transformers
 
 ### News & Visualization
-- `alpaca-py>=0.7.0` - Professional news data API
+- `alpaca-py` - Alpaca market and news API (pinned in `requirements.txt`)
 - `matplotlib>=3.7.0` - Chart visualization
 - `tqdm>=4.65.0` - Progress bars for batch processing
 
