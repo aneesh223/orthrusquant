@@ -5,7 +5,8 @@ Randomly selects from pools of tickers, strategies, and date ranges for comprehe
 Features parallel execution with configurable threading for faster batch processing
 """
 
-import subprocess
+import csv
+import json
 import sys
 import os
 import random
@@ -103,69 +104,115 @@ def select_random_parameters():
     
     return ticker, strategy, start_date, end_date, description, category
 
-def run_backtest(ticker, strategy, start_date, end_date, description="", print_header=True):
-    """Run a single backtest and capture results"""
-    cmd = [sys.executable, 'backtester/run_backtest.py', ticker, strategy, start_date, end_date, '--no-plot']
-    
+SUMMARY_FIELDS = [
+    "success", "ticker", "strategy", "category", "start_date", "end_date", "period",
+    "total_return_pct", "buy_hold_return_pct", "percent_alpha", "cagr_pct", "sharpe",
+    "max_drawdown_pct", "num_trades", "benchmark_ticker", "benchmark_return_pct",
+    "sentiment_coverage_pct", "error",
+]
+
+
+def _iso(value):
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+def summarize_result(result):
+    """One JSON/CSV row from a structured backtest result. No stdout scraping."""
+    row = {field: result.get(field) for field in SUMMARY_FIELDS}
+    row["success"] = bool(result.get("success"))
+    row["start_date"] = _iso(result.get("start_date"))
+    row["end_date"] = _iso(result.get("end_date"))
+    if row["percent_alpha"] is None and result.get("total_return_pct") is not None and result.get("buy_hold_return_pct") is not None:
+        row["percent_alpha"] = result["total_return_pct"] - result["buy_hold_return_pct"]
+    if row["num_trades"] is None and result.get("trades") is not None:
+        row["num_trades"] = result.get("trades")
+    return row
+
+
+def aggregate_percent_alpha(results):
+    alphas = [
+        r["percent_alpha"] for r in results
+        if r.get("success") and r.get("percent_alpha") is not None
+    ]
+    if not alphas:
+        return {"count": 0, "mean_percent_alpha": None, "positive_alpha": 0}
+    return {
+        "count": len(alphas),
+        "mean_percent_alpha": sum(alphas) / len(alphas),
+        "positive_alpha": sum(1 for value in alphas if value > 0),
+    }
+
+
+def write_batch_results(path_prefix, results, seed, params):
+    """Write structured rows plus the seed and parameters to JSON and CSV."""
+    rows = [summarize_result(r) for r in results]
+    payload = {
+        "seed": seed,
+        "params": params,
+        "summary": aggregate_percent_alpha(rows),
+        "results": rows,
+    }
+    json_path = path_prefix if str(path_prefix).endswith(".json") else f"{path_prefix}.json"
+    csv_path = json_path[:-5] + ".csv"
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
+    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return json_path, csv_path
+
+
+def run_backtest(ticker, strategy, start_date, end_date, description="", print_header=True,
+                 initial_cash=10000.0, commission_bps=5.0, slippage_bps=5.0, benchmark=None,
+                 news_lookback_days=None):
+    """Run one backtest in-process and return its result dict."""
     if print_header:
         print(f"\n{'='*80}")
         print(f"TEST: {ticker} {strategy.upper()} | {start_date} to {end_date}")
         if description:
             print(f"{description}")
         print('='*80)
-    
+
+    parent = os.path.join(os.path.dirname(__file__), "..")
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    from backtester.backtester import AlpacaBacktester
+
+    strategy_name = "momentum" if str(strategy).lower() in ("m", "momentum") else "value"
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)  # 5 minute timeout
-        
-        if result.returncode == 0:
-            # Extract key metrics from output
-            lines = result.stdout.split('\n')
-            strategy_return = None
-            buy_hold_return = None
-            dollar_alpha = None
-            relative_alpha = None
-            trades = None
-            regime = None
-            
-            for line in lines:
-                if "Strategy Return:" in line:
-                    strategy_return = line.split(":")[1].strip()
-                elif "Buy & Hold Return:" in line:
-                    buy_hold_return = line.split(":")[1].strip()
-                elif "Dollar Alpha:" in line:
-                    # Extract dollar alpha value (e.g., "$+123.45" or "$-123.45")
-                    dollar_alpha = line.split(":")[1].strip()
-                elif "Relative Alpha:" in line:
-                    # Extract relative alpha percentage (e.g., "+1.23% of initial capital")
-                    relative_alpha = line.split(":")[1].strip().split("%")[0].strip()
-                elif "Number of Trades:" in line:
-                    trades = line.split(":")[1].strip()
-                elif "Initial Regime:" in line:
-                    regime = line.split(":")[1].strip()
-            
-            return {
-                'success': True,
-                'strategy_return': strategy_return,
-                'buy_hold_return': buy_hold_return,
-                'dollar_alpha': dollar_alpha,
-                'relative_alpha': relative_alpha,
-                'trades': trades,
-                'regime': regime,
-                'ticker': ticker,
-                'strategy': strategy.upper(),
-                'period': f"{start_date} to {end_date}",
-                'description': description
-            }
-        else:
-            print(f"FAILED: {result.stderr}")
-            return {'success': False, 'ticker': ticker, 'strategy': strategy.upper(), 'error': result.stderr}
-            
-    except subprocess.TimeoutExpired:
-        print(f"TIMEOUT: Test took longer than 5 minutes")
-        return {'success': False, 'ticker': ticker, 'strategy': strategy.upper(), 'error': 'Timeout'}
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return {'success': False, 'ticker': ticker, 'strategy': strategy.upper(), 'error': str(e)}
+        engine = AlpacaBacktester(
+            ticker,
+            strategy=strategy_name,
+            initial_cash=initial_cash,
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
+            benchmark=benchmark,
+            news_lookback_days=news_lookback_days,
+        )
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+        results = engine.run(start, end)
+        results["success"] = True
+        results["percent_alpha"] = results["total_return_pct"] - results["buy_hold_return_pct"]
+        results["strategy"] = strategy_name.upper() if len(strategy_name) > 1 else strategy_name
+        results["period"] = f"{start_date} to {end_date}"
+        results["description"] = description
+        results["num_trades"] = results.get("num_trades", len(results.get("trade_log", [])))
+        return results
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        return {
+            "success": False,
+            "ticker": ticker,
+            "strategy": strategy_name.upper(),
+            "error": str(exc),
+            "description": description,
+            "period": f"{start_date} to {end_date}",
+        }
 
 def main():
     """Run random batch tests with threading support"""
@@ -177,6 +224,14 @@ def main():
     parser.add_argument('--seed', type=int, help='Random seed for reproducible results')
     parser.add_argument('--threads', type=int, default=4, 
                        help='Number of concurrent threads (default: 4)')
+    parser.add_argument('--benchmark', default=None,
+                       help='Benchmark ticker bought at the same next-open convention (for example SPY)')
+    parser.add_argument('--output', default='batch_results',
+                       help='Prefix for the JSON and CSV result files (default: batch_results)')
+    parser.add_argument('--commission-bps', type=float, default=5.0,
+                       help='Commission in basis points per side (default: 5)')
+    parser.add_argument('--slippage-bps', type=float, default=5.0,
+                       help='Slippage in basis points per side (default: 5)')
     
     args = parser.parse_args()
     
@@ -218,7 +273,11 @@ def main():
             print('='*80)
         
         # Run the backtest without printing header (we already printed it above)
-        result = run_backtest(ticker, strategy, start_date, end_date, description, print_header=False)
+        result = run_backtest(
+            ticker, strategy, start_date, end_date, description, print_header=False,
+            commission_bps=args.commission_bps, slippage_bps=args.slippage_bps,
+            benchmark=args.benchmark,
+        )
         result['category'] = category  # Add category for analysis
         result['test_num'] = test_num
         
@@ -227,9 +286,10 @@ def main():
             if result['success']:
                 successful += 1
                 # Show quick result
-                dollar_alpha = result.get('dollar_alpha', 'N/A')
-                trades = result.get('trades', 'N/A')
-                print(f"✅ [{test_num}/{args.num_tests}] {ticker}: {dollar_alpha} alpha, {trades} trades ({completed}/{args.num_tests} complete)")
+                percent_alpha = result.get('percent_alpha')
+                alpha_text = "n/a" if percent_alpha is None else f"{percent_alpha:+.2f}%"
+                trades = result.get('num_trades', 'N/A')
+                print(f"✅ [{test_num}/{args.num_tests}] {ticker}: {alpha_text} percent alpha, {trades} trades ({completed}/{args.num_tests} complete)")
             else:
                 print(f"❌ [{test_num}/{args.num_tests}] {ticker}: Failed - {result.get('error', 'Unknown error')} ({completed}/{args.num_tests} complete)")
         
@@ -286,56 +346,47 @@ def main():
             print("-" * 60)
             
             for result in cat_results:
-                # Parse dollar alpha for color coding (e.g., "$+123.45" or "$-123.45")
-                try:
-                    dollar_val = float(result['dollar_alpha'].replace('$', '').replace('+', '').replace(',', ''))
-                    alpha_color = "🟢" if dollar_val > 0 else "🔴" if dollar_val < -500 else "🟡"
-                except:
+                percent_alpha = result.get('percent_alpha')
+                if percent_alpha is None:
                     alpha_color = "🟡"
+                    alpha_text = "n/a"
+                else:
+                    alpha_color = "🟢" if percent_alpha > 0 else "🔴" if percent_alpha < -1 else "🟡"
+                    alpha_text = f"{percent_alpha:+.2f}%"
                 
-                print(f"{alpha_color} {result['ticker']} {result['strategy']}: {result['dollar_alpha']} alpha | {result['trades']} trades | {result['regime']}")
-                print(f"   Strategy: {result['strategy_return']} vs Buy-Hold: {result['buy_hold_return']}")
+                print(f"{alpha_color} {result['ticker']} {result['strategy']}: {alpha_text} percent alpha | {result.get('num_trades')} trades | {result.get('initial_regime')}")
+                print(f"   Strategy: {result.get('total_return_pct')}% vs Buy-Hold: {result.get('buy_hold_return_pct')}%")
                 print(f"   Period: {result['period']}")
                 print()
         
-        # Calculate overall statistics using dollar alpha
-        dollar_alphas = []
-        momentum_dollar_alphas = []
-        value_dollar_alphas = []
+        summary = aggregate_percent_alpha(successful_results)
+        momentum = [r['percent_alpha'] for r in successful_results if r.get('strategy') in ('M', 'MOMENTUM') and r.get('percent_alpha') is not None]
+        value = [r['percent_alpha'] for r in successful_results if r.get('strategy') in ('V', 'VALUE') and r.get('percent_alpha') is not None]
         
-        for result in successful_results:
-            if result['dollar_alpha']:
-                try:
-                    # Parse dollar alpha (e.g., "$+123.45" or "$-123.45")
-                    dollar_val = float(result['dollar_alpha'].replace('$', '').replace('+', '').replace(',', ''))
-                    dollar_alphas.append(dollar_val)
-                    
-                    if result['strategy'] == 'M':
-                        momentum_dollar_alphas.append(dollar_val)
-                    else:
-                        value_dollar_alphas.append(dollar_val)
-                except:
-                    pass
-        
-        if dollar_alphas:
-            avg_dollar_alpha = sum(dollar_alphas) / len(dollar_alphas)
-            positive_alpha_count = sum(1 for a in dollar_alphas if a > 0)
-            near_zero_count = sum(1 for a in dollar_alphas if -200 <= a <= 200)
-            
-            print(f"\nOVERALL STATISTICS")
-            print("-" * 40)
-            print(f"Average Dollar Alpha: ${avg_dollar_alpha:+,.2f}")
-            print(f"Positive Alpha: {positive_alpha_count}/{len(dollar_alphas)} ({positive_alpha_count/len(dollar_alphas)*100:.1f}%)")
-            print(f"Near Buy-Hold (±$200): {near_zero_count}/{len(dollar_alphas)} ({near_zero_count/len(dollar_alphas)*100:.1f}%)")
-            
-            if momentum_dollar_alphas:
-                momentum_avg = sum(momentum_dollar_alphas) / len(momentum_dollar_alphas)
-                print(f"Momentum Strategy Avg: ${momentum_avg:+,.2f} ({len(momentum_dollar_alphas)} tests)")
-            
-            if value_dollar_alphas:
-                value_avg = sum(value_dollar_alphas) / len(value_dollar_alphas)
-                print(f"Value Strategy Avg: ${value_avg:+,.2f} ({len(value_dollar_alphas)} tests)")
+        print(f"\nOVERALL STATISTICS")
+        print("-" * 40)
+        if summary["count"]:
+            mean_alpha = summary["mean_percent_alpha"]
+            print(f"Average Percent Alpha: {mean_alpha:+.2f}%")
+            print(f"Positive Alpha: {summary['positive_alpha']}/{summary['count']} ({summary['positive_alpha']/summary['count']*100:.1f}%)")
+            if momentum:
+                print(f"Momentum Strategy Avg: {sum(momentum)/len(momentum):+.2f}% ({len(momentum)} tests)")
+            if value:
+                print(f"Value Strategy Avg: {sum(value)/len(value):+.2f}% ({len(value)} tests)")
+        else:
+            print("No percent-alpha figures to aggregate")
     
+    params = {
+        "num_tests": args.num_tests,
+        "threads": args.threads,
+        "benchmark": args.benchmark,
+        "commission_bps": args.commission_bps,
+        "slippage_bps": args.slippage_bps,
+        "seed": args.seed,
+    }
+    json_path, csv_path = write_batch_results(args.output, results, args.seed, params)
+    print(f"\nWrote {json_path} and {csv_path}")
+
     print(f"\n{'='*80}")
     print("TIP: Run with --seed <number> for reproducible results")
     print("TIP: Use --threads <number> to control parallel execution (default: 4)")

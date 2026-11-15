@@ -28,9 +28,21 @@ sys.path.insert(0, parent_dir)
 
 from src import config, market, analyzer, scraper
 try:
-    from backtester.metrics import affordable_shares, buy_fill, sell_fill
+    from backtester.metrics import (
+        affordable_shares,
+        buy_and_hold_result,
+        buy_fill,
+        performance_metrics,
+        sell_fill,
+    )
 except ImportError:  # script-style launch puts this directory on sys.path
-    from metrics import affordable_shares, buy_fill, sell_fill
+    from metrics import (
+        affordable_shares,
+        buy_and_hold_result,
+        buy_fill,
+        performance_metrics,
+        sell_fill,
+    )
 from src.logic import (
     detect_market_regime,
     get_adaptive_risk_params,
@@ -104,7 +116,8 @@ class AlpacaBacktester:
     
     def __init__(self, ticker: str, strategy: str = "momentum", initial_cash: float = 10000.0,
                  news_lookback_days: Optional[int] = None,
-                 commission_bps: float = 5.0, slippage_bps: float = 5.0):
+                 commission_bps: float = 5.0, slippage_bps: float = 5.0,
+                 benchmark: Optional[str] = None):
         """
         Initialize the backtester
         
@@ -126,6 +139,7 @@ class AlpacaBacktester:
             raise ValueError("Commission and slippage must be non-negative")
         self.commission_bps = float(commission_bps)
         self.slippage_bps = float(slippage_bps)
+        self.benchmark = benchmark.upper() if benchmark else None
         
         # Portfolio tracking
         self.cash = initial_cash
@@ -169,7 +183,7 @@ class AlpacaBacktester:
             print("Alpaca client initialized successfully")
         return self._alpaca_client
     
-    def fetch_historical_data(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    def fetch_historical_data(self, start_date: datetime, end_date: datetime, symbol: str = None) -> pd.DataFrame:
         """
         Fetch historical daily bars from Alpaca
         
@@ -181,11 +195,12 @@ class AlpacaBacktester:
             DataFrame with OHLCV data
         """
         try:
-            print(f"Fetching historical data for {self.ticker} from {start_date.date()} to {end_date.date()}...")
+            symbol = (symbol or self.ticker).upper()
+            print(f"Fetching historical data for {symbol} from {start_date.date()} to {end_date.date()}...")
             
             # Create request for daily bars
             request_params = StockBarsRequest(
-                symbol_or_symbols=[self.ticker],
+                symbol_or_symbols=[symbol],
                 timeframe=TimeFrame.Day,
                 start=start_date,
                 end=end_date
@@ -223,7 +238,7 @@ class AlpacaBacktester:
                 print(f"Fetched {len(price_data)} days of price data")
                 return price_data
             else:
-                print(f"No price data found for {self.ticker}")
+                print(f"No price data found for {symbol}")
                 return pd.DataFrame()
                 
         except Exception as e:
@@ -984,46 +999,52 @@ class AlpacaBacktester:
                 print(f"Error on {simulation_date.date()}: {e}")
                 continue
         
-        # Final portfolio value
-        final_price = self.portfolio_history[-1]['Price'] if self.portfolio_history else 0
-        final_portfolio_value = self.cash + (self.shares * final_price)
+        # Final portfolio value is the last close mark, after any fill at that open.
+        final_portfolio_value = (
+            self.portfolio_history[-1]['Portfolio_Value'] if self.portfolio_history else self.cash
+        )
+        stats = performance_metrics(self.portfolio_history, self.initial_cash, len(self.trade_log))
+        total_return = stats['total_return_pct']
+
+        # Buy-and-hold enters at the next open, the first price the strategy can fill.
+        hold = buy_and_hold_result(
+            self.full_price_data,
+            trading_days,
+            self.initial_cash,
+            self.commission_bps,
+            self.slippage_bps,
+        )
+        buy_hold_return = hold['return_pct']
+        if hold['entry_date'] is not None:
+            print(
+                f"Buy-and-Hold: entered at next open on {hold['entry_date'].date()} "
+                f"at ${hold['quoted_entry']:.2f}"
+            )
+
+        benchmark_return = None
+        if self.benchmark:
+            bench_prices = self.benchmark_prices
+            if bench_prices is None:
+                bench_prices = self.fetch_historical_data(
+                    start_date - timedelta(days=5), end_date, symbol=self.benchmark
+                )
+            bench = buy_and_hold_result(
+                bench_prices,
+                trading_days,
+                self.initial_cash,
+                self.commission_bps,
+                self.slippage_bps,
+            )
+            benchmark_return = bench['return_pct']
+            print(f"{self.benchmark} benchmark return: {benchmark_return:+.2f}%")
         
-        # Calculate performance metrics
-        if self.initial_cash > 0:
-            total_return = ((final_portfolio_value - self.initial_cash) / self.initial_cash) * 100
-        else:
-            total_return = 0
-        
-        # Buy-and-Hold Comparison: Always start on Day 1 for fair comparison
-        # Since our algorithm CAN buy on Day 1, buy-and-hold should always start on Day 1
-        if len(trading_days) > 0:
-            try:
-                initial_price = self.full_price_data.loc[trading_days[0], 'Close']
-                if initial_price > 0 and self.initial_cash > 0:
-                    buy_hold_shares = self.initial_cash / initial_price
-                    buy_hold_value = buy_hold_shares * final_price
-                    buy_hold_return = ((buy_hold_value - self.initial_cash) / self.initial_cash) * 100
-                    
-                    print(f"Buy-and-Hold: Started on {trading_days[0].date()} at ${initial_price:.2f} (Day 1 - fair comparison)")
-                else:
-                    buy_hold_return = 0
-            except (KeyError, IndexError):
-                print("Warning: Could not calculate buy-and-hold return due to missing price data")
-                buy_hold_return = 0
-        else:
-            buy_hold_return = 0
-        
-        # Calculate dollar-based alpha for more accurate representation
-        # This shows the actual dollar difference in gains
-        buy_hold_final_value = self.initial_cash * (1 + buy_hold_return / 100)
+        buy_hold_final_value = hold['final_value']
         strategy_gain = final_portfolio_value - self.initial_cash
         buy_hold_gain = buy_hold_final_value - self.initial_cash
         dollar_alpha = strategy_gain - buy_hold_gain
         
-        # Calculate percentage-based alpha (relative to initial capital)
-        # This shows how much better/worse the strategy performed as a % of initial investment
         pct_point_alpha = total_return - buy_hold_return
-        relative_alpha = (dollar_alpha / self.initial_cash) * 100
+        relative_alpha = (dollar_alpha / self.initial_cash) * 100 if self.initial_cash else 0.0
         coverage = sentiment_coverage(trading_days, observation_dates)
         
         results = {
@@ -1036,7 +1057,15 @@ class AlpacaBacktester:
             'final_cash': self.cash,
             'final_shares': self.shares,
             'total_return_pct': total_return,
+            'cagr_pct': stats['cagr_pct'],
+            'sharpe': stats['sharpe'],
+            'max_drawdown_pct': stats['max_drawdown_pct'],
             'buy_hold_return_pct': buy_hold_return,
+            'buy_hold_entry_date': hold['entry_date'],
+            'percent_alpha': pct_point_alpha,
+            'benchmark_ticker': self.benchmark,
+            'benchmark_return_pct': benchmark_return,
+            'benchmark_alpha': None if benchmark_return is None else total_return - benchmark_return,
             'alpha': pct_point_alpha,  # Keep for backward compatibility
             'dollar_alpha': dollar_alpha,  # New: actual dollar difference
             'relative_alpha': relative_alpha,  # New: alpha as % of initial capital
@@ -1072,8 +1101,20 @@ class AlpacaBacktester:
         print(f"Final Shares: {results['final_shares']}")
         print()
         print(f"Strategy Return: {results['total_return_pct']:+.2f}%")
+        cagr = results.get('cagr_pct')
+        sharpe = results.get('sharpe')
+        print(f"CAGR: {'n/a' if cagr is None else f'{cagr:+.2f}%'}")
+        print(f"Sharpe: {'n/a' if sharpe is None else f'{sharpe:.2f}'}")
+        print(f"Max Drawdown: {results.get('max_drawdown_pct', 0):+.2f}%")
         print(f"Buy & Hold Return: {results['buy_hold_return_pct']:+.2f}%")
         print(f"Alpha (Percentage Points): {results['alpha']:+.2f}%")
+        if results.get('benchmark_ticker'):
+            bench_ret = results.get('benchmark_return_pct')
+            bench_alpha = results.get('benchmark_alpha')
+            bench_ret_s = "n/a" if bench_ret is None else f"{bench_ret:+.2f}%"
+            bench_alpha_s = "n/a" if bench_alpha is None else f"{bench_alpha:+.2f}%"
+            print(f"{results['benchmark_ticker']} Return: {bench_ret_s}")
+            print(f"Alpha vs {results['benchmark_ticker']}: {bench_alpha_s}")
         print()
         print(f"Dollar Performance:")
         print(f"   Strategy Gain: ${results['strategy_gain']:+,.2f}")
