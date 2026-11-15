@@ -87,17 +87,22 @@ class AlpacaBacktester:
         # Data storage
         self.full_price_data = None
         self.full_news_data = None
-        
-        # Initialize Alpaca client
-        try:
-            self.alpaca_client = StockHistoricalDataClient(
-                api_key=config.API_KEY,
-                secret_key=config.API_SECRET
+        self.benchmark_prices = None
+
+        # Alpaca client is created on the first live request so constructing a
+        # backtester with injected prices does not require real API keys.
+        self._alpaca_client = None
+
+    @property
+    def alpaca_client(self):
+        if self._alpaca_client is None:
+            api_key, api_secret = config.require_api_keys()
+            self._alpaca_client = StockHistoricalDataClient(
+                api_key=api_key,
+                secret_key=api_secret
             )
             print("Alpaca client initialized successfully")
-        except Exception as e:
-            print(f"Error initializing Alpaca client: {e}")
-            raise
+        return self._alpaca_client
     
     def fetch_historical_data(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
         """
@@ -242,7 +247,7 @@ class AlpacaBacktester:
             if isinstance(news_date, str):
                 try:
                     news_date = datetime.fromisoformat(news_date.replace('Z', '+00:00'))
-                except:
+                except ValueError:
                     continue
             elif not isinstance(news_date, datetime):
                 continue
@@ -418,19 +423,6 @@ class AlpacaBacktester:
         
         return False, ""
     
-    def check_buy_and_hold_mode(self, market_regime: str) -> bool:
-        """
-        Check if we should enter buy-and-hold mode for sustained bull markets
-        
-        Args:
-            market_regime: Current market regime
-            
-        Returns:
-            True if in buy-and-hold mode
-        """
-        risk_params = self.get_adaptive_risk_params(market_regime, current_date=None)  # Safe default if no date passed
-        return risk_params.get('buy_and_hold_mode', False)
-    
     def check_overtrading_protection(self, current_date: datetime, market_regime: str) -> bool:
         """
         Check if overtrading protection should prevent a trade
@@ -476,11 +468,6 @@ class AlpacaBacktester:
         # Check overtrading protection
         if action == "BUY" and self.check_overtrading_protection(date, market_regime):
             print(f"OVERTRADING PROTECTION: Blocking BUY signal (Score: {buy_score:.1f}) - too many recent trades")
-            return
-        
-        # Check buy-and-hold mode
-        if action == "SELL" and self.check_buy_and_hold_mode(market_regime):
-            print(f"🔒 BUY-AND-HOLD MODE: Blocking SELL signal (Score: {buy_score:.1f}) - sustained bull market detected")
             return
         
         if action == "BUY" and self.cash > 0:

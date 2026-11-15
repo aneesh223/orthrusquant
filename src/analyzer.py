@@ -289,7 +289,7 @@ def get_hybrid_sentiment_batch(texts, ticker="", batch_size=32):
                 try:
                     scores = vader_analyzer.polarity_scores(cleaned_text)
                     vader_scores.append(scores['compound'])
-                except:
+                except (AttributeError, TypeError, ValueError):
                     vader_scores.append(get_simple_sentiment(cleaned_text))
         else:
             vader_scores = [get_simple_sentiment(text) for text in texts]

@@ -1,4 +1,3 @@
-import ssl
 import yfinance as yf
 from gnews import GNews
 from datetime import datetime, timedelta
@@ -7,15 +6,8 @@ from functools import lru_cache
 import concurrent.futures
 from threading import Lock
 import time
-import config
+from src import config
 import logging
-
-# SSL optimization
-try:
-    _create_unverified_https_context = ssl._create_unverified_context
-    ssl._create_default_https_context = _create_unverified_https_context
-except AttributeError:
-    pass
 
 # Thread-safe cache
 _profile_cache = {}
@@ -139,8 +131,9 @@ def scrape_alpaca_news(ticker, days=30, end_date=None):
                 if isinstance(created_at, str):
                     try:
                         created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    except:
-                        created_at = datetime.now(pytz.utc)
+                    except ValueError:
+                        logging.warning("Skipping Alpaca article with an unparseable timestamp")
+                        continue
                 
                 if created_at and headline:
                     parsed.append([created_at, headline, source])
@@ -195,8 +188,10 @@ def scrape_gnews(ticker, days=30, end_date=None):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(google_news.get_news, q) for q in search_queries]
             for f in concurrent.futures.as_completed(futures):
-                try: results.extend(f.result())
-                except: pass
+                try:
+                    results.extend(f.result())
+                except Exception as exc:
+                    logging.error(f"GNews query failed: {exc}")
         
         for item in results:
             title = item.get('title')

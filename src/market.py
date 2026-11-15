@@ -1,7 +1,7 @@
 import pandas as pd
 import yfinance as yf
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, date, time, timedelta
 import pytz
 from functools import lru_cache
 from threading import Lock
@@ -718,14 +718,14 @@ def get_visualization_data(ticker, sentiment_df, timeframe_days=30):
                         if timestamp in price_data.index:
                             price = price_data.loc[timestamp, 'Close']
                             buy_signals.append((timestamp, price))
-                    except:
+                    except (KeyError, TypeError, ValueError):
                         pass
                 elif row['Buy_Score'] < 4.0:
                     try:
                         if timestamp in price_data.index:
                             price = price_data.loc[timestamp, 'Close']
                             sell_signals.append((timestamp, price))
-                    except:
+                    except (KeyError, TypeError, ValueError):
                         pass
         
         # Resample price data to match sentiment frequency
@@ -807,7 +807,8 @@ def get_trading_recommendation(ticker: str, final_buy_score: float, sentiment_df
     try:
         stock = yf.Ticker(ticker)
         price_data = stock.history(period="6mo")  # 6 months for regime detection
-    except:
+    except Exception as exc:
+        logging.warning(f"Could not load price history for {ticker}: {exc}")
         price_data = None
     
     return shared_get_trading_recommendation(ticker, final_buy_score, sentiment_df, price_data, strategy=strategy)
