@@ -27,6 +27,10 @@ parent_dir = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, parent_dir)
 
 from src import config, market, analyzer, scraper
+try:
+    from backtester.metrics import affordable_shares, buy_fill, sell_fill
+except ImportError:  # script-style launch puts this directory on sys.path
+    from metrics import affordable_shares, buy_fill, sell_fill
 from src.logic import (
     detect_market_regime,
     get_adaptive_risk_params,
@@ -99,7 +103,8 @@ class AlpacaBacktester:
     """
     
     def __init__(self, ticker: str, strategy: str = "momentum", initial_cash: float = 10000.0,
-                 news_lookback_days: Optional[int] = None):
+                 news_lookback_days: Optional[int] = None,
+                 commission_bps: float = 5.0, slippage_bps: float = 5.0):
         """
         Initialize the backtester
         
@@ -116,6 +121,11 @@ class AlpacaBacktester:
         self.initial_cash = initial_cash
         # None requests news for the whole simulation. An int caps the window.
         self.news_lookback_days = news_lookback_days
+        # Per-side costs. 5 bps of commission and 5 bps of slippage by default.
+        if commission_bps < 0 or slippage_bps < 0:
+            raise ValueError("Commission and slippage must be non-negative")
+        self.commission_bps = float(commission_bps)
+        self.slippage_bps = float(slippage_bps)
         
         # Portfolio tracking
         self.cash = initial_cash
@@ -341,12 +351,16 @@ class AlpacaBacktester:
                 print(f"Warning: Invalid price {price} for BUY order, skipping...")
                 return
                 
-            shares_to_buy = int(self.cash / price)
+            shares_to_buy = affordable_shares(
+                self.cash, price, self.commission_bps, self.slippage_bps
+            )
             if shares_to_buy > 0:
-                cost = shares_to_buy * price
+                fill_price, notional, commission, cost = buy_fill(
+                    price, shares_to_buy, self.commission_bps, self.slippage_bps
+                )
                 self.cash -= cost
                 self.shares += shares_to_buy
-                self.entry_price = price  # Track entry price for risk management
+                self.entry_price = fill_price  # Track entry price for risk management
                 
                 # Track first buy for fair buy-and-hold comparison
                 if self.first_buy_date is None:
@@ -358,6 +372,9 @@ class AlpacaBacktester:
                     'Action': 'BUY',
                     'Shares': shares_to_buy,
                     'Price': price,
+                    'Fill_Price': fill_price,
+                    'Commission': commission,
+                    'Notional': notional,
                     'Cost': cost,
                     'Buy_Score': buy_score,
                     'Cash_After': self.cash,
@@ -368,13 +385,16 @@ class AlpacaBacktester:
         
         elif action == "SELL" and self.shares > 0:
             # Sell all shares
-            proceeds = self.shares * price
+            sold_shares = self.shares
+            fill_price, notional, commission, proceeds = sell_fill(
+                price, sold_shares, self.commission_bps, self.slippage_bps
+            )
             self.cash += proceeds
             
             # Calculate P&L for this trade
             if self.entry_price and self.entry_price > 0:
-                pnl_pct = ((price - self.entry_price) / self.entry_price) * 100
-                pnl_dollar = (price - self.entry_price) * self.shares
+                pnl_pct = ((fill_price - self.entry_price) / self.entry_price) * 100
+                pnl_dollar = (fill_price - self.entry_price) * sold_shares - commission
             else:
                 pnl_pct = 0
                 pnl_dollar = 0
@@ -382,8 +402,11 @@ class AlpacaBacktester:
             self.trade_log.append({
                 'Date': date,
                 'Action': 'SELL',
-                'Shares': self.shares,
+                'Shares': sold_shares,
                 'Price': price,
+                'Fill_Price': fill_price,
+                'Commission': commission,
+                'Notional': notional,
                 'Proceeds': proceeds,
                 'Buy_Score': buy_score,
                 'Cash_After': self.cash,
@@ -547,28 +570,35 @@ class AlpacaBacktester:
             # Apply conviction to position sizing
             final_position_multiplier = base_position_multiplier * conviction_score
             
-            # Calculate adaptive position size with conviction
-            base_shares = int(self.cash / price)
+            # Size off the all-in cost so commission and slippage fit in cash.
+            base_shares = affordable_shares(
+                self.cash, price, self.commission_bps, self.slippage_bps
+            )
             adjusted_shares = int(base_shares * final_position_multiplier)
             shares_to_buy = min(adjusted_shares, base_shares)  # Don't exceed available cash
             
             if shares_to_buy > 0:
-                cost = shares_to_buy * price
+                fill_price, notional, commission, cost = buy_fill(
+                    price, shares_to_buy, self.commission_bps, self.slippage_bps
+                )
                 self.cash -= cost
                 self.shares += shares_to_buy
-                self.entry_price = price  # Track entry price for risk management
+                self.entry_price = fill_price  # Economic entry, including slippage
                 self.last_buy_date = date  # Track buy date for minimum holding period
                 
                 # Track first buy for fair buy-and-hold comparison
                 if self.first_buy_date is None:
                     self.first_buy_date = date
-                    self.first_buy_price = price
+                    self.first_buy_price = fill_price
                 
                 self.trade_log.append({
                     'Date': date,
                     'Action': 'BUY',
                     'Shares': shares_to_buy,
                     'Price': price,
+                    'Fill_Price': fill_price,
+                    'Commission': commission,
+                    'Notional': notional,
                     'Cost': cost,
                     'Buy_Score': buy_score,
                     'Market_Regime': market_regime,
@@ -587,13 +617,16 @@ class AlpacaBacktester:
         
         elif action == "SELL" and self.shares > 0:
             # Sell all shares
-            proceeds = self.shares * price
+            sold_shares = self.shares
+            fill_price, notional, commission, proceeds = sell_fill(
+                price, sold_shares, self.commission_bps, self.slippage_bps
+            )
             self.cash += proceeds
             
-            # Calculate P&L for this trade
+            # Calculate P&L for this trade against the cost-adjusted entry
             if self.entry_price and self.entry_price > 0:
-                pnl_pct = ((price - self.entry_price) / self.entry_price) * 100
-                pnl_dollar = (price - self.entry_price) * self.shares
+                pnl_pct = ((fill_price - self.entry_price) / self.entry_price) * 100
+                pnl_dollar = (fill_price - self.entry_price) * sold_shares - commission
             else:
                 pnl_pct = 0
                 pnl_dollar = 0
@@ -601,8 +634,11 @@ class AlpacaBacktester:
             self.trade_log.append({
                 'Date': date,
                 'Action': 'SELL',
-                'Shares': self.shares,
+                'Shares': sold_shares,
                 'Price': price,
+                'Fill_Price': fill_price,
+                'Commission': commission,
+                'Notional': notional,
                 'Proceeds': proceeds,
                 'Buy_Score': buy_score,
                 'Market_Regime': market_regime,
@@ -1014,6 +1050,8 @@ class AlpacaBacktester:
             'regime_updates': regime_update_counter,
             'news_source': 'alpaca',
             'news_days_requested': getattr(self, '_news_days_requested', None),
+            'commission_bps': self.commission_bps,
+            'slippage_bps': self.slippage_bps,
             **coverage,
         }
         
@@ -1044,6 +1082,10 @@ class AlpacaBacktester:
         print(f"   Relative Alpha: {results['relative_alpha']:+.2f}% of initial capital")
         print()
         print(f"Number of Trades: {results['num_trades']}")
+        print(
+            f"Transaction Costs: {results.get('commission_bps', 0):.1f} bps commission "
+            f"+ {results.get('slippage_bps', 0):.1f} bps slippage, per side"
+        )
         coverage_pct = results.get('sentiment_coverage_pct')
         if coverage_pct is not None:
             print(
