@@ -96,31 +96,85 @@ def _as_calendar_date(value):
     return value
 
 
-def sentiment_coverage(trading_days, observation_dates) -> Dict:
-    """Share of sessions whose score can come from a real sentiment row.
+# Same decay the rolling buy-score window uses. More recent rows weigh more.
+_SENTIMENT_DECAY = 0.5
 
-    A day is covered when some observation falls on or before it. Days with
-    nothing yet fall back to the neutral score of 5.0.
+
+def fresh_sentiment(observations, day, freshness_days, decay=_SENTIMENT_DECAY):
+    """Recency-weighted compound for headlines whose UTC date is in [day-N+1, day].
+
+    Returns ``(compound, covered)``. No row in the window means a neutral
+    compound of 0.0 and covered=False. A headline dated after ``day`` is ignored.
+    """
+    if freshness_days < 1:
+        raise ValueError("sentiment_freshness_days must be at least 1")
+    start = day - timedelta(days=freshness_days - 1)
+    chosen = [(obs_day, score) for obs_day, score in observations.items() if start <= obs_day <= day]
+    if not chosen:
+        return 0.0, False
+    ago = np.array([(day - obs_day).days for obs_day, _ in chosen], dtype=float)
+    weights = np.exp(-decay * ago)
+    weights = weights / weights.sum()
+    scores = np.array([score for _, score in chosen], dtype=float)
+    return float(np.dot(scores, weights)), True
+
+
+def sentiment_by_date(sentiment_df) -> Dict:
+    """Map each sentiment row to its UTC calendar date."""
+    out = {}
+    if sentiment_df is None or getattr(sentiment_df, "empty", True):
+        return out
+    for ts, row in sentiment_df.iterrows():
+        out[_as_calendar_date(ts)] = float(row["Compound_Score"])
+    return out
+
+
+def daily_sentiment_frame(trading_days, observations, freshness_days):
+    """One row per session: the fresh compound, or 0.0 when nothing is in window."""
+    index = []
+    compounds = []
+    covered = {}
+    for ts in trading_days:
+        day = _as_calendar_date(ts)
+        compound, is_covered = fresh_sentiment(observations, day, freshness_days)
+        index.append(ts)
+        compounds.append(compound)
+        covered[day] = (compound, is_covered)
+    frame = pd.DataFrame({"Compound_Score": compounds}, index=pd.DatetimeIndex(index))
+    return frame, covered
+
+
+def sentiment_coverage(trading_days, observation_dates, freshness_days: int = 5) -> Dict:
+    """Share of sessions with at least one sentiment row inside the freshness window.
+
+    A day is not covered just because some older article exists. The row has
+    to fall on a UTC date in ``[day - freshness_days + 1, day]``.
     """
     days = list(trading_days)
+    freshness_days = int(freshness_days)
     if not days:
         return {
             "sentiment_coverage_pct": 0.0,
             "sentiment_covered_days": 0,
             "neutral_fallback_days": 0,
             "sentiment_observation_days": 0,
+            "sentiment_freshness_days": freshness_days,
         }
     observations = sorted({_as_calendar_date(d) for d in observation_dates})
     covered = 0
     for day in days:
         key = _as_calendar_date(day)
-        if bisect.bisect_right(observations, key) > 0:
+        start = key - timedelta(days=freshness_days - 1)
+        lo = bisect.bisect_left(observations, start)
+        hi = bisect.bisect_right(observations, key)
+        if hi > lo:
             covered += 1
     return {
         "sentiment_coverage_pct": 100.0 * covered / len(days),
         "sentiment_covered_days": covered,
         "neutral_fallback_days": len(days) - covered,
         "sentiment_observation_days": len(observations),
+        "sentiment_freshness_days": freshness_days,
     }
 
 
@@ -132,7 +186,8 @@ class AlpacaBacktester:
     def __init__(self, ticker: str, strategy: str = "momentum", initial_cash: float = 10000.0,
                  news_lookback_days: Optional[int] = None,
                  commission_bps: float = 5.0, slippage_bps: float = 5.0,
-                 benchmark: Optional[str] = None):
+                 benchmark: Optional[str] = None,
+                 sentiment_freshness_days: int = 5):
         """
         Initialize the backtester
         
@@ -155,6 +210,9 @@ class AlpacaBacktester:
         self.commission_bps = float(commission_bps)
         self.slippage_bps = float(slippage_bps)
         self.benchmark = benchmark.upper() if benchmark else None
+        if int(sentiment_freshness_days) < 1:
+            raise ValueError("sentiment_freshness_days must be at least 1")
+        self.sentiment_freshness_days = int(sentiment_freshness_days)
         
         # Portfolio tracking
         self.cash = initial_cash
@@ -742,12 +800,14 @@ class AlpacaBacktester:
         print(f"Simulating {len(trading_days)} trading days...")
         
         observation_dates = []
-        # OPTIMIZATION: Skip sentiment analysis for very short periods (< 7 days)
-        # Use neutral scores to avoid expensive NLP processing. Coverage stays
-        # at zero so the report shows that those days are not real sentiment.
-        if simulation_days < 7 or len(self.full_news_data) == 0:
+        sentiment_for_day = {}
+        # Windows under 7 days skip NLP and use a neutral score. That is reported
+        # as zero sentiment coverage. Longer windows score every session.
+        if simulation_days < 7:
             print(f"⚡ Fast mode: Using neutral scores for {simulation_days}-day period (no sentiment analysis)")
             score_lookup = {date.date() if hasattr(date, 'date') else date: 5.0 for date in trading_days}
+            for date in trading_days:
+                sentiment_for_day[_as_calendar_date(date)] = (0.0, False)
         else:
             # OPTIMIZATION: Analyze ALL news articles ONCE and calculate ALL scores ONCE
             print(f"🧠 Analyzing {len(self.full_news_data)} news articles (one-time processing)...")
@@ -759,41 +819,38 @@ class AlpacaBacktester:
                 print(f"Error in sentiment analysis: {e}")
                 full_sentiment_df = pd.DataFrame()
             
-            if full_sentiment_df.empty:
-                print("No sentiment data available, using neutral scores")
-                # Create a simple lookup with neutral scores for all trading days
-                score_lookup = {date.date() if hasattr(date, 'date') else date: 5.0 for date in trading_days}
-            else:
-                # PRE-CALCULATE ALL Final_Buy_Scores using the complete dataset
-                print(f"🔢 Pre-calculating all Final_Buy_Scores for entire period...")
-                
-                # Calculate verdict using the FULL sentiment and price data
-                verdict = market.calculate_verdict(
-                    ticker=self.ticker,
-                    sentiment_df=full_sentiment_df,
-                    strategy=self.strategy,
-                    lookback_days=simulation_days + 210,
-                    # Anchor the price window to the backtest end. None uses
-                    # datetime.now(), so the same history would score differently
-                    # on a later day.
-                    custom_date=end_date,
-                    price_data=self.full_price_data  # Use full price data
+            observations = sentiment_by_date(full_sentiment_df)
+            observation_dates = list(observations.keys())
+            # One compound per session. Headlines older than the freshness
+            # window become neutral instead of being carried forward.
+            daily_sentiment, sentiment_for_day = daily_sentiment_frame(
+                trading_days, observations, self.sentiment_freshness_days
+            )
+            print(f"🔢 Pre-calculating Final_Buy_Scores for {len(trading_days)} sessions...")
+            verdict = market.calculate_verdict(
+                ticker=self.ticker,
+                sentiment_df=daily_sentiment,
+                strategy=self.strategy,
+                lookback_days=simulation_days + 210,
+                # Anchor the price window to the backtest end. None uses
+                # datetime.now(), so the same history would score differently
+                # on a later day.
+                custom_date=end_date,
+                price_data=self.full_price_data
+            )
+            score_lookup = {}
+            for timestamp, score in verdict.get('Final_Buy_Scores_Over_Time', []):
+                date_key = timestamp.date() if hasattr(timestamp, 'date') else timestamp
+                score_lookup[date_key] = score
+            missing = [
+                _as_calendar_date(day) for day in trading_days
+                if _as_calendar_date(day) not in score_lookup
+            ]
+            if missing:
+                raise KeyError(
+                    f"No Final_Buy_Score for {missing[0]}; refusing to reuse an older score"
                 )
-                
-                # Extract all Final_Buy_Scores and create a lookup dictionary
-                final_buy_scores_over_time = verdict.get('Final_Buy_Scores_Over_Time', [])
-                score_lookup = {}
-                
-                for timestamp, score in final_buy_scores_over_time:
-                    # Create lookup by date for fast access
-                    if hasattr(timestamp, 'date'):
-                        date_key = timestamp.date()
-                    else:
-                        date_key = timestamp
-                    score_lookup[date_key] = score
-                
-                observation_dates = list(full_sentiment_df.index)
-                print(f"Pre-calculated {len(score_lookup)} Final_Buy_Scores")
+            print(f"Pre-calculated {len(score_lookup)} Final_Buy_Scores")
         
         print()
         
@@ -899,20 +956,15 @@ class AlpacaBacktester:
                     pending_sell_reason = ""
                 
                 
-                # FAST LOOKUP: Get pre-calculated Final_Buy_Score for this date
+                # Every session has its own score. Reusing the previous day would
+                # freeze that day's technicals as well as its sentiment.
                 sim_date_key = simulation_date.date() if hasattr(simulation_date, 'date') else simulation_date
-                
-                # Look for exact match first
-                if sim_date_key in score_lookup:
-                    buy_score_t = score_lookup[sim_date_key]
-                else:
-                    # Find the most recent score on or before this date
-                    valid_dates = [d for d in score_lookup.keys() if d <= sim_date_key]
-                    if valid_dates:
-                        most_recent_date = max(valid_dates)
-                        buy_score_t = score_lookup[most_recent_date]
-                    else:
-                        buy_score_t = 5.0  # Neutral fallback
+                if sim_date_key not in score_lookup:
+                    raise KeyError(
+                        f"No Final_Buy_Score for {sim_date_key}; refusing to reuse an older score"
+                    )
+                buy_score_t = score_lookup[sim_date_key]
+                sentiment_compound, sentiment_covered = sentiment_for_day.get(sim_date_key, (0.0, False))
                 
                 # Add to score history for dynamic thresholds and momentum reversal detection
                 score_history.append(buy_score_t)
@@ -1041,6 +1093,8 @@ class AlpacaBacktester:
                     'Shares': self.shares,
                     'Portfolio_Value': portfolio_value,
                     'Final_Buy_Score': buy_score_t,  # Use pre-calculated Final_Buy_Score
+                    'Sentiment_Compound': sentiment_compound,
+                    'Sentiment_Covered': sentiment_covered,
                     'Market_Regime': current_market_regime  # Track dynamic regime changes
                 })
                 
@@ -1103,7 +1157,9 @@ class AlpacaBacktester:
         
         pct_point_alpha = total_return - buy_hold_return
         relative_alpha = (dollar_alpha / self.initial_cash) * 100 if self.initial_cash else 0.0
-        coverage = sentiment_coverage(eval_days, observation_dates)
+        coverage = sentiment_coverage(
+            eval_days, observation_dates, self.sentiment_freshness_days
+        )
         
         results = {
             'ticker': self.ticker,
