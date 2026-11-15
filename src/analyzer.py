@@ -593,6 +593,12 @@ def get_sentiment(parsed_data, ticker, timeframe_days=30):
                               for s in df['Source']], dtype=np.float32)
     df['Weight'] = source_weights
     df['Compound_Score'] = np.clip(df['Raw_Score'] * df['Weight'], -1.0, 1.0).astype('float32')
+
+    # The scraper returns newest-first. Sort before grouping so the aggregated
+    # index is chronological. groupby(sort=False) preserved newest-first order,
+    # and the rolling window in calculate_verdict then treated future days as
+    # already inside the window for earlier scores.
+    df = df.sort_values('Timestamp', ascending=True, kind='mergesort')
     
     # Time grouping
     if timeframe_days <= 1:
@@ -615,16 +621,16 @@ def get_sentiment(parsed_data, ticker, timeframe_days=30):
         return np.sum(scores * weights) / weight_sum if weight_sum > 0 else 0.0
     
     # Main aggregation
-    result_df = df.groupby('TimeGroup', sort=False).agg({
+    result_df = df.groupby('TimeGroup', sort=True).agg({
         'Raw_Score': 'mean', 
         'Weight': 'mean'
     }).astype(np.float32)
     
     # Calculate weighted compound scores
     try:
-        weighted_scores = df.groupby('TimeGroup', sort=False).apply(weighted_mean, include_groups=False)
+        weighted_scores = df.groupby('TimeGroup', sort=True).apply(weighted_mean, include_groups=False)
     except TypeError:
-        weighted_scores = df.groupby('TimeGroup', sort=False).apply(weighted_mean)
+        weighted_scores = df.groupby('TimeGroup', sort=True).apply(weighted_mean)
     
     result_df['Compound_Score'] = weighted_scores.astype(np.float32)
     
@@ -636,11 +642,11 @@ def get_sentiment(parsed_data, ticker, timeframe_days=30):
             count_col = f'{source_type.title()}_Count'
             
             try:
-                sentiment_scores = source_df.groupby('TimeGroup', sort=False).apply(weighted_mean, include_groups=False)
+                sentiment_scores = source_df.groupby('TimeGroup', sort=True).apply(weighted_mean, include_groups=False)
             except TypeError:
-                sentiment_scores = source_df.groupby('TimeGroup', sort=False).apply(weighted_mean)
+                sentiment_scores = source_df.groupby('TimeGroup', sort=True).apply(weighted_mean)
             
-            counts = source_df.groupby('TimeGroup', sort=False).size()
+            counts = source_df.groupby('TimeGroup', sort=True).size()
             
             result_df[sentiment_col] = sentiment_scores.reindex(result_df.index, fill_value=0).astype(np.float32)
             result_df[count_col] = counts.reindex(result_df.index, fill_value=0).astype(np.int16)
