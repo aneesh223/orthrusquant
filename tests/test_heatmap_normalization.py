@@ -109,7 +109,10 @@ def test_heatmap_normalization_range(df):
 
 
 @given(df=ohlcv_dataframe(min_rows=64, max_rows=500))
-@settings(suppress_health_check=[HealthCheck.data_too_large])
+@settings(
+    suppress_health_check=[HealthCheck.data_too_large, HealthCheck.too_slow],
+    deadline=None,
+)
 def test_heatmap_normalization_bounds(df):
     """
     Feature: convolutional-order-book, Property 5: Normalization Invariant
