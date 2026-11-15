@@ -58,6 +58,10 @@ import bisect
 import warnings
 warnings.filterwarnings("ignore")
 
+# Regime is re-detected on this fixed cadence. Tying it to the length of the
+# window made a short replay of the same past update on different days.
+REGIME_UPDATE_INTERVAL = 10
+
 
 def news_window_days(simulation_days: int, news_lookback_days: Optional[int] = None) -> int:
     """How many days of news to request.
@@ -802,10 +806,6 @@ class AlpacaBacktester:
         print(f"Initial Adaptive Parameters: Stop-loss: {risk_params['stop_loss_pct']*100:.0f}%, Take-profit: {risk_params['take_profit_pct']*100:.0f}%, Position size: {risk_params['position_size_multiplier']:.1f}x")
         print()
         
-        # OPTIMIZATION: Reduce regime update frequency for longer backtests
-        # Update every 5 days for short tests, every 10 days for long tests
-        regime_update_interval = 10 if simulation_days > 180 else 5
-        
         # Simulation loop - now extremely fast since everything is pre-calculated
         score_history = []  # Track scores for dynamic thresholds and momentum reversal detection
         regime_update_counter = 0  # Track how often we update regime
@@ -923,7 +923,7 @@ class AlpacaBacktester:
                 
                 # OPTIMIZATION: Reduce momentum reversal detection frequency
                 # Check for regime changes at configurable intervals (not every 5 days)
-                if i > 0 and i % regime_update_interval == 0 and len(score_history) >= 10:
+                if i > 0 and i % REGIME_UPDATE_INTERVAL == 0 and len(score_history) >= 10:
                     # Get recent price data for reversal detection
                     try:
                         recent_price_data = self.full_price_data.loc[:simulation_date].tail(10)
@@ -985,7 +985,7 @@ class AlpacaBacktester:
                     self.current_bull_duration = 0
                 
                 # OPTIMIZATION: Continually re-evaluate regime without future data
-                if i > 0 and i % regime_update_interval == 0:
+                if i > 0 and i % REGIME_UPDATE_INTERVAL == 0:
                     current_market_regime = self.detect_market_regime(self.full_price_data, simulation_date)
                 
                 # ADAPTIVE RISK MANAGEMENT: Check regime-specific stop-loss/take-profit first

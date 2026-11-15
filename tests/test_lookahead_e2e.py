@@ -227,7 +227,6 @@ def test_b_truncating_at_T_does_not_change_the_past(seed, strategy):
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("seed,strategy", CASES)
-@pytest.mark.xfail(strict=True, reason="window-length regime cadence, fixed in item 2")
 def test_c_short_window_truncation_does_not_change_the_past(seed, strategy):
     prices = make_prices(seed)
     news = make_news(seed, prices)
