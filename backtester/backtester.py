@@ -542,7 +542,10 @@ class AlpacaBacktester:
         """
         Calculate adaptive buy/sell thresholds using shared logic with strategy-specific optimizations and bull market duration
         """
-        return calculate_adaptive_thresholds(score_history, market_regime, lookback, strategy=self.strategy, bull_market_duration=self.current_bull_duration)
+        return calculate_adaptive_thresholds(
+            score_history, market_regime, lookback, strategy=self.strategy,
+            bull_market_duration=self.current_bull_duration, ticker=self.ticker,
+        )
     
     def check_adaptive_risk_management(self, current_price: float, portfolio_value: float, market_regime: str, current_date: datetime = None) -> Tuple[bool, str]:
         """
