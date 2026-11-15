@@ -70,6 +70,17 @@ def news_window_days(simulation_days: int, news_lookback_days: Optional[int] = N
     return max(1, int(news_lookback_days))
 
 
+def _as_utc_datetime(value):
+    """Normalize a split date to UTC. Bare dates start at midnight."""
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        value = datetime.combine(value, datetime.min.time())
+    if value.tzinfo is None:
+        return pytz.utc.localize(value)
+    return value.astimezone(pytz.utc)
+
+
 def _as_calendar_date(value):
     if isinstance(value, datetime):
         return value.date()
@@ -671,7 +682,8 @@ class AlpacaBacktester:
             self.shares = 0
             self.entry_price = None  # Reset entry price
     
-    def run(self, start_date: datetime, end_date: datetime, lookback_days: int = 30) -> Dict:
+    def run(self, start_date: datetime, end_date: datetime, lookback_days: int = 30,
+            split_date: datetime = None) -> Dict:
         """
         Run the backtesting simulation with fully optimized pre-calculated scores and momentum reversal detection
         
@@ -805,6 +817,16 @@ class AlpacaBacktester:
         pending_sell_score = 0
         pending_sell_regime = None
         pending_sell_reason = ""
+
+        split_ts = _as_utc_datetime(split_date) if split_date is not None else None
+        if split_ts is not None:
+            held_out_days = [day for day in trading_days if day >= split_ts]
+            if len(held_out_days) < 2:
+                print("Warning: split date does not leave two held-out sessions; reporting the full window")
+                split_ts = None
+        frozen_thresholds = None
+        test_started = False
+        train_trade_log = []
         
         for i, simulation_date in enumerate(trading_days):
             try:
@@ -819,6 +841,34 @@ class AlpacaBacktester:
                 if current_close <= 0 or current_open <= 0:
                     print(f"Warning: Invalid price for {simulation_date.date()}, skipping...")
                     continue
+
+                # Tune on the dates before split_date, then reset the book and
+                # freeze those thresholds for the held-out sessions.
+                if split_ts is not None and not test_started and simulation_date >= split_ts:
+                    frozen_thresholds = self.calculate_adaptive_thresholds(
+                        score_history, current_market_regime
+                    )
+                    train_trade_log = list(self.trade_log)
+                    self.trade_log = []
+                    self.portfolio_history = []
+                    self.cash = self.initial_cash
+                    self.shares = 0
+                    self.entry_price = None
+                    self.last_buy_date = None
+                    self.first_buy_date = None
+                    self.first_buy_price = None
+                    self.max_portfolio_value = self.initial_cash
+                    self.recent_trades = []
+                    self.last_trade_date = None
+                    pending_buy_shares = 0
+                    pending_sell = False
+                    pending_sell_reason = ""
+                    test_started = True
+                    print(
+                        f"Held-out period starts {simulation_date.date()} "
+                        f"with frozen thresholds buy>={frozen_thresholds[0]:.3f} "
+                        f"sell<={frozen_thresholds[1]:.3f}"
+                    )
                 
                 # OPTIMIZATION V9: EXECUTION LOOKAHEAD BIAS FIX
                 # Execute any pending trades from the PREVIOUS day at TODAY'S Open price.
@@ -946,8 +996,11 @@ class AlpacaBacktester:
                     pending_sell_reason = risk_reason
                     print(f"Pending {risk_reason} for T+1 Open")
                 else:
-                    # ADAPTIVE THRESHOLDS: Calculate regime-aware buy/sell thresholds
-                    buy_threshold, sell_threshold = self.calculate_adaptive_thresholds(score_history, current_market_regime)
+                    # Thresholds are frozen from the training window once a split is active.
+                    if frozen_thresholds is not None:
+                        buy_threshold, sell_threshold = frozen_thresholds
+                    else:
+                        buy_threshold, sell_threshold = self.calculate_adaptive_thresholds(score_history, current_market_regime)
                     
                     # Debug: Print adaptive thresholds for first few days
                     if i < 3:
@@ -1003,13 +1056,15 @@ class AlpacaBacktester:
         final_portfolio_value = (
             self.portfolio_history[-1]['Portfolio_Value'] if self.portfolio_history else self.cash
         )
+        eval_days = [day for day in trading_days if split_ts is None or day >= split_ts] if test_started else list(trading_days)
         stats = performance_metrics(self.portfolio_history, self.initial_cash, len(self.trade_log))
         total_return = stats['total_return_pct']
 
         # Buy-and-hold enters at the next open, the first price the strategy can fill.
+        # After a train/test split this is the held-out window only.
         hold = buy_and_hold_result(
             self.full_price_data,
-            trading_days,
+            eval_days,
             self.initial_cash,
             self.commission_bps,
             self.slippage_bps,
@@ -1030,7 +1085,7 @@ class AlpacaBacktester:
                 )
             bench = buy_and_hold_result(
                 bench_prices,
-                trading_days,
+                eval_days,
                 self.initial_cash,
                 self.commission_bps,
                 self.slippage_bps,
@@ -1045,7 +1100,7 @@ class AlpacaBacktester:
         
         pct_point_alpha = total_return - buy_hold_return
         relative_alpha = (dollar_alpha / self.initial_cash) * 100 if self.initial_cash else 0.0
-        coverage = sentiment_coverage(trading_days, observation_dates)
+        coverage = sentiment_coverage(eval_days, observation_dates)
         
         results = {
             'ticker': self.ticker,
@@ -1081,6 +1136,14 @@ class AlpacaBacktester:
             'news_days_requested': getattr(self, '_news_days_requested', None),
             'commission_bps': self.commission_bps,
             'slippage_bps': self.slippage_bps,
+            'split_date': split_ts,
+            'split_applied': test_started,
+            'eval_start': eval_days[0] if eval_days else start_date,
+            'eval_end': eval_days[-1] if eval_days else end_date,
+            'frozen_buy_threshold': None if frozen_thresholds is None else frozen_thresholds[0],
+            'frozen_sell_threshold': None if frozen_thresholds is None else frozen_thresholds[1],
+            'train_num_trades': len(train_trade_log),
+            'train_trade_log': train_trade_log,
             **coverage,
         }
         
@@ -1095,6 +1158,13 @@ class AlpacaBacktester:
         print(f"Ticker: {results['ticker']}")
         print(f"Strategy: {results['strategy'].upper()}")
         print(f"Period: {results['start_date'].date()} to {results['end_date'].date()}")
+        if results.get('split_applied'):
+            print(
+                f"Held-out evaluation: {results['eval_start'].date()} to {results['eval_end'].date()} "
+                f"(thresholds frozen at {results['frozen_buy_threshold']:.3f}/"
+                f"{results['frozen_sell_threshold']:.3f}; "
+                f"{results.get('train_num_trades', 0)} training trades excluded)"
+            )
         print(f"Initial Cash: ${results['initial_cash']:,.2f}")
         print(f"Final Portfolio Value: ${results['final_portfolio_value']:,.2f}")
         print(f"Final Cash: ${results['final_cash']:,.2f}")

@@ -8,7 +8,7 @@ Constants for Orthrus trading logic.
 SECTOR_THRESHOLDS = {
     # Volatile Growth - Ultra aggressive (fast movers, sentiment lags)
     'TSLA': -0.20, 'NVDA': -0.20, 'AMD': -0.20, 'ROKU': -0.20,
-    'PLTR': -0.20, 'ZOOM': -0.20, 'NFLX': -0.15,
+    'PLTR': -0.20, 'ZM': -0.20, 'NFLX': -0.15,
 
     # Mega Cap Tech - Very aggressive (tech rallies are fast)
     'AAPL': -0.15, 'MSFT': -0.15, 'GOOGL': -0.15,

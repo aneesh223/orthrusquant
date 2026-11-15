@@ -15,14 +15,34 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-def get_random_date_range(strategy=None):
+def get_random_date_range(strategy=None, optimal_periods=False):
     """
     Generate random start and end dates within Alpaca free tier support
     Respects strategy-specific timeframe restrictions from input.py
     
     Args:
         strategy: 'm' for momentum, 'v' for value (affects max period length)
+        optimal_periods: sample 3-5y momentum or 5-10y value windows
     """
+    if optimal_periods:
+        if strategy == 'm':
+            period_days = random.choice(MOMENTUM_OPTIMAL_DAYS)
+        elif strategy == 'v':
+            period_days = random.choice(VALUE_OPTIMAL_DAYS)
+        else:
+            period_days = random.choice(MOMENTUM_OPTIMAL_DAYS + VALUE_OPTIMAL_DAYS)
+        latest_end = min(datetime(2024, 12, 31), datetime.now() - timedelta(days=15))
+        earliest_start = datetime(2014, 1, 15)
+        latest_start = latest_end - timedelta(days=period_days)
+        if latest_start <= earliest_start:
+            start_date = earliest_start
+        else:
+            start_date = earliest_start + timedelta(days=random.randint(0, (latest_start - earliest_start).days))
+        end_date = start_date + timedelta(days=period_days)
+        if end_date > latest_end:
+            end_date = latest_end
+        return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+
     # Define the available date range (Alpaca free tier with good data quality)
     start_year = 2020
     end_year = 2024
@@ -71,21 +91,58 @@ def get_random_date_range(strategy=None):
     
     return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
 
-def get_ticker_pools():
-    """Define pools of tickers by category for diverse testing"""
-    return {
-        'mega_cap_tech': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'],
-        'large_cap_tech': ['NFLX', 'ADBE', 'CRM', 'ORCL', 'INTC', 'AMD', 'AVGO'],
-        'financials': ['JPM', 'BAC', 'WFC', 'GS', 'MS', 'C', 'BRK.B'],
-        'healthcare': ['JNJ', 'PFE', 'UNH', 'ABBV', 'MRK', 'TMO', 'DHR'],
-        'consumer': ['KO', 'PEP', 'WMT', 'HD', 'MCD', 'NKE', 'SBUX'],
-        'energy': ['XOM', 'CVX', 'COP', 'EOG', 'SLB', 'MPC', 'VLO'],
-        'industrials': ['BA', 'CAT', 'GE', 'MMM', 'HON', 'UPS', 'RTX'],
-        'volatile_growth': ['TSLA', 'NVDA', 'AMD', 'NFLX', 'ZOOM', 'ROKU', 'PLTR']
-    }
+# Fixed in advance of any backtest result. Names are not added or removed
+# because a past run looked good or bad. ZOOM is not a listed ticker; the
+# Zoom Video Communications listing is ZM.
+TICKER_POOLS = {
+    'mega_cap_tech': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'],
+    'large_cap_tech': ['NFLX', 'ADBE', 'CRM', 'ORCL', 'INTC', 'AMD', 'AVGO'],
+    'financials': ['JPM', 'BAC', 'WFC', 'GS', 'MS', 'C', 'BRK.B'],
+    'healthcare': ['JNJ', 'PFE', 'UNH', 'ABBV', 'MRK', 'TMO', 'DHR'],
+    'consumer': ['KO', 'PEP', 'WMT', 'HD', 'MCD', 'NKE', 'SBUX'],
+    'energy': ['XOM', 'CVX', 'COP', 'EOG', 'SLB', 'MPC', 'VLO'],
+    'industrials': ['BA', 'CAT', 'GE', 'MMM', 'HON', 'UPS', 'RTX'],
+    'volatile_growth': ['TSLA', 'NVDA', 'AMD', 'NFLX', 'ZM', 'ROKU', 'PLTR'],
+}
 
-def select_random_parameters():
-    """Randomly select ticker, strategy, and date range with strategy-aware timeframes"""
+# Strategy-aware windows used by --optimal-periods. Diversity mode stays short.
+MOMENTUM_OPTIMAL_DAYS = (1095, 1460, 1825)  # 3, 4, and 5 years
+VALUE_OPTIMAL_DAYS = (1825, 2555, 3650)  # 5, 7, and 10 years
+
+
+def get_ticker_pools():
+    """Return the fixed ticker universe. See ``TICKER_POOLS``."""
+    return TICKER_POOLS
+
+def apply_seed(seed):
+    """Seed the RNG. ``0`` counts; only ``None`` means "leave the RNG alone"."""
+    if seed is not None:
+        random.seed(seed)
+        return True
+    return False
+
+
+def resolve_split_date(start_date, end_date, split_date=None, train_ratio=None):
+    """Pick the held-out boundary. An explicit date wins over a train ratio."""
+    if split_date:
+        if isinstance(split_date, datetime):
+            return split_date
+        return datetime.strptime(str(split_date), "%Y-%m-%d")
+    if train_ratio is None:
+        return None
+    if not 0 < float(train_ratio) < 1:
+        raise ValueError("train_ratio must be between 0 and 1")
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    return start + timedelta(days=int((end - start).days * float(train_ratio)))
+
+
+def select_random_parameters(optimal_periods=False):
+    """Randomly select ticker, strategy, and date range with strategy-aware timeframes.
+
+    The ticker is drawn from ``TICKER_POOLS``, which is fixed before any
+    results are observed.
+    """
     ticker_pools = get_ticker_pools()
     
     # Randomly select a category and then a ticker from that category
@@ -96,7 +153,7 @@ def select_random_parameters():
     strategy = random.choice(['m', 'v'])  # momentum or value
     
     # Generate random date range respecting strategy timeframe restrictions
-    start_date, end_date = get_random_date_range(strategy)
+    start_date, end_date = get_random_date_range(strategy, optimal_periods=optimal_periods)
     
     # Create description
     strategy_name = "MOMENTUM" if strategy == 'm' else "VALUE"
@@ -168,7 +225,7 @@ def write_batch_results(path_prefix, results, seed, params):
 
 def run_backtest(ticker, strategy, start_date, end_date, description="", print_header=True,
                  initial_cash=10000.0, commission_bps=5.0, slippage_bps=5.0, benchmark=None,
-                 news_lookback_days=None):
+                 news_lookback_days=None, split_date=None):
     """Run one backtest in-process and return its result dict."""
     if print_header:
         print(f"\n{'='*80}")
@@ -195,7 +252,7 @@ def run_backtest(ticker, strategy, start_date, end_date, description="", print_h
         )
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d")
-        results = engine.run(start, end)
+        results = engine.run(start, end, split_date=split_date)
         results["success"] = True
         results["percent_alpha"] = results["total_return_pct"] - results["buy_hold_return_pct"]
         results["strategy"] = strategy_name.upper() if len(strategy_name) > 1 else strategy_name
@@ -232,12 +289,17 @@ def main():
                        help='Commission in basis points per side (default: 5)')
     parser.add_argument('--slippage-bps', type=float, default=5.0,
                        help='Slippage in basis points per side (default: 5)')
+    parser.add_argument('--optimal-periods', action='store_true',
+                       help='Sample long strategy-aware windows (momentum 3-5y, value 5-10y)')
+    parser.add_argument('--split-date', default=None,
+                       help='YYYY-MM-DD held-out start. Thresholds are tuned before this date')
+    parser.add_argument('--train-ratio', type=float, default=None,
+                       help='Fraction of each window used to tune thresholds; the rest is held out')
     
     args = parser.parse_args()
     
-    # Set random seed if provided
-    if args.seed:
-        random.seed(args.seed)
+    # Seed 0 is a valid seed. A truthiness check would ignore it.
+    if apply_seed(args.seed):
         print(f"Using random seed: {args.seed}")
     
     print("ORTHRUS RANDOM BATCH BACKTESTING")
@@ -248,7 +310,9 @@ def main():
     # Generate all test parameters upfront for thread safety
     test_params = []
     for i in range(args.num_tests):
-        ticker, strategy, start_date, end_date, description, category = select_random_parameters()
+        ticker, strategy, start_date, end_date, description, category = select_random_parameters(
+            optimal_periods=args.optimal_periods
+        )
         test_params.append((i+1, ticker, strategy, start_date, end_date, description, category))
     
     results = []
@@ -277,6 +341,9 @@ def main():
             ticker, strategy, start_date, end_date, description, print_header=False,
             commission_bps=args.commission_bps, slippage_bps=args.slippage_bps,
             benchmark=args.benchmark,
+            split_date=resolve_split_date(
+                start_date, end_date, args.split_date, args.train_ratio
+            ),
         )
         result['category'] = category  # Add category for analysis
         result['test_num'] = test_num
@@ -383,6 +450,10 @@ def main():
         "commission_bps": args.commission_bps,
         "slippage_bps": args.slippage_bps,
         "seed": args.seed,
+        "optimal_periods": args.optimal_periods,
+        "split_date": args.split_date,
+        "train_ratio": args.train_ratio,
+        "ticker_universe": "fixed in advance; see TICKER_POOLS",
     }
     json_path, csv_path = write_batch_results(args.output, results, args.seed, params)
     print(f"\nWrote {json_path} and {csv_path}")
