@@ -38,15 +38,68 @@ from src.logic import (
     detect_momentum_reversal
 )
 from typing import Dict, List, Tuple, Optional
+import bisect
 import warnings
 warnings.filterwarnings("ignore")
+
+
+def news_window_days(simulation_days: int, news_lookback_days: Optional[int] = None) -> int:
+    """How many days of news to request.
+
+    ``None`` means the whole simulation plus a short buffer, with no 90-day
+    cap. Pass an int to cap the request (the old behavior was a hard 90).
+    """
+    if news_lookback_days is None:
+        return max(1, int(simulation_days) + 10)
+    return max(1, int(news_lookback_days))
+
+
+def _as_calendar_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if hasattr(value, "date") and not isinstance(value, datetime):
+        try:
+            return value.date()
+        except (TypeError, ValueError):
+            return value
+    return value
+
+
+def sentiment_coverage(trading_days, observation_dates) -> Dict:
+    """Share of sessions whose score can come from a real sentiment row.
+
+    A day is covered when some observation falls on or before it. Days with
+    nothing yet fall back to the neutral score of 5.0.
+    """
+    days = list(trading_days)
+    if not days:
+        return {
+            "sentiment_coverage_pct": 0.0,
+            "sentiment_covered_days": 0,
+            "neutral_fallback_days": 0,
+            "sentiment_observation_days": 0,
+        }
+    observations = sorted({_as_calendar_date(d) for d in observation_dates})
+    covered = 0
+    for day in days:
+        key = _as_calendar_date(day)
+        if bisect.bisect_right(observations, key) > 0:
+            covered += 1
+    return {
+        "sentiment_coverage_pct": 100.0 * covered / len(days),
+        "sentiment_covered_days": covered,
+        "neutral_fallback_days": len(days) - covered,
+        "sentiment_observation_days": len(observations),
+    }
+
 
 class AlpacaBacktester:
     """
     Backtesting system that simulates trading strategies using historical Alpaca data
     """
     
-    def __init__(self, ticker: str, strategy: str = "momentum", initial_cash: float = 10000.0):
+    def __init__(self, ticker: str, strategy: str = "momentum", initial_cash: float = 10000.0,
+                 news_lookback_days: Optional[int] = None):
         """
         Initialize the backtester
         
@@ -61,6 +114,8 @@ class AlpacaBacktester:
         self.ticker = ticker.upper()
         self.strategy = strategy.lower()
         self.initial_cash = initial_cash
+        # None requests news for the whole simulation. An int caps the window.
+        self.news_lookback_days = news_lookback_days
         
         # Portfolio tracking
         self.cash = initial_cash
@@ -181,8 +236,10 @@ class AlpacaBacktester:
             if end_date:
                 print(f"   Historical news ending at: {end_date.date()}")
             
-            # Use the existing scraper to get news data with historical support
-            profile_data, news_data = scraper.scrape_hybrid(self.ticker, days=days, end_date=end_date)
+            # Alpaca/Benzinga only. GNews does not honor a historical end date.
+            profile_data, news_data = scraper.scrape_historical_news(
+                self.ticker, days=days, end_date=end_date
+            )
             
             print(f"Fetched {len(news_data)} news articles")
             return news_data
@@ -206,12 +263,16 @@ class AlpacaBacktester:
         if end_date.tzinfo is None:
             end_date = pytz.utc.localize(end_date)
             
-        # Fetch price data with some buffer before start_date for technical indicators
-        price_start = start_date - timedelta(days=200)  # Buffer for 200-day SMA
-        self.full_price_data = self.fetch_historical_data(price_start, end_date)
+        # Fetch price data with some buffer before start_date for technical indicators.
+        # Injected frames are kept so offline runs do not open a client.
+        if self.full_price_data is None or self.full_price_data.empty:
+            price_start = start_date - timedelta(days=200)  # Buffer for 200-day SMA
+            self.full_price_data = self.fetch_historical_data(price_start, end_date)
         
-        # Fetch news data with historical end date
-        self.full_news_data = self.fetch_news_data(days=news_days, end_date=end_date)
+        # Fetch news data with historical end date. An empty list is a real
+        # result (no articles) and is not replaced by a live call.
+        if self.full_news_data is None:
+            self.full_news_data = self.fetch_news_data(days=news_days, end_date=end_date)
         
         if self.full_price_data.empty:
             raise ValueError(f"No price data available for {self.ticker}")
@@ -588,11 +649,13 @@ class AlpacaBacktester:
         else:
             end_date = end_date.astimezone(pytz.utc)
         
-        # OPTIMIZATION: Limit news data to simulation period + small buffer
-        # Fetching 90+ days of news for short backtests is wasteful
+        # News covers the whole simulation unless the caller set a cap.
+        # The previous hard 90-day cap left every earlier session on a
+        # neutral 5.0 because no article had been requested for it.
         simulation_days = (end_date - start_date).days
-        news_days = min(90, max(30, simulation_days + 10))  # Cap at 90 days, min 30 days
+        news_days = news_window_days(simulation_days, self.news_lookback_days)
         self.prepare_simulation_data(start_date, end_date, news_days)
+        self._news_days_requested = news_days
         
         # Get trading days from price data
         trading_days = self.full_price_data[
@@ -611,8 +674,10 @@ class AlpacaBacktester:
         
         print(f"Simulating {len(trading_days)} trading days...")
         
+        observation_dates = []
         # OPTIMIZATION: Skip sentiment analysis for very short periods (< 7 days)
-        # Use neutral scores to avoid expensive NLP processing
+        # Use neutral scores to avoid expensive NLP processing. Coverage stays
+        # at zero so the report shows that those days are not real sentiment.
         if simulation_days < 7 or len(self.full_news_data) == 0:
             print(f"⚡ Fast mode: Using neutral scores for {simulation_days}-day period (no sentiment analysis)")
             score_lookup = {date.date() if hasattr(date, 'date') else date: 5.0 for date in trading_days}
@@ -657,8 +722,7 @@ class AlpacaBacktester:
                         date_key = timestamp
                     score_lookup[date_key] = score
                 
-                print(f"Pre-calculated {len(score_lookup)} Final_Buy_Scores")
-                
+                observation_dates = list(full_sentiment_df.index)
                 print(f"Pre-calculated {len(score_lookup)} Final_Buy_Scores")
         
         print()
@@ -924,6 +988,7 @@ class AlpacaBacktester:
         # This shows how much better/worse the strategy performed as a % of initial investment
         pct_point_alpha = total_return - buy_hold_return
         relative_alpha = (dollar_alpha / self.initial_cash) * 100
+        coverage = sentiment_coverage(trading_days, observation_dates)
         
         results = {
             'ticker': self.ticker,
@@ -946,7 +1011,10 @@ class AlpacaBacktester:
             'trade_log': self.trade_log,
             'initial_regime': initial_market_regime,
             'final_regime': current_market_regime,
-            'regime_updates': regime_update_counter
+            'regime_updates': regime_update_counter,
+            'news_source': 'alpaca',
+            'news_days_requested': getattr(self, '_news_days_requested', None),
+            **coverage,
         }
         
         self.print_results(results)
@@ -976,6 +1044,15 @@ class AlpacaBacktester:
         print(f"   Relative Alpha: {results['relative_alpha']:+.2f}% of initial capital")
         print()
         print(f"Number of Trades: {results['num_trades']}")
+        coverage_pct = results.get('sentiment_coverage_pct')
+        if coverage_pct is not None:
+            print(
+                f"Sentiment Coverage: {coverage_pct:.1f}% "
+                f"({results.get('sentiment_covered_days', 0)} covered, "
+                f"{results.get('neutral_fallback_days', 0)} neutral fallback, "
+                f"{results.get('sentiment_observation_days', 0)} observation days, "
+                f"source={results.get('news_source', 'alpaca')})"
+            )
         
         # Market regime information
         initial_regime = results.get('initial_regime', 'N/A')

@@ -76,6 +76,57 @@ def test_alpaca_news_skips_bad_timestamps(monkeypatch):
     assert articles[0][1] == "Kept"
 
 
+def test_gnews_drops_articles_outside_the_requested_window(monkeypatch):
+    class FakeGNews:
+        def __init__(self, *args, **kwargs):
+            self.start_date = None
+            self.end_date = None
+
+        def get_news(self, query):
+            return [
+                {
+                    "title": "too new",
+                    "published date": "Wed, 01 Jun 2022 00:00:00 GMT",
+                    "publisher": {"title": "X"},
+                },
+                {
+                    "title": "in range",
+                    "published date": "Wed, 01 Dec 2021 00:00:00 GMT",
+                    "publisher": {"title": "Y"},
+                },
+                {
+                    "title": "too old",
+                    "published date": "Wed, 01 Jan 2020 00:00:00 GMT",
+                    "publisher": {"title": "Z"},
+                },
+            ]
+
+    monkeypatch.setattr(scraper, "GNews", FakeGNews)
+    monkeypatch.setattr(scraper, "get_profile_data", lambda ticker: (ticker, "N/A", "N/A"))
+    _, articles = scraper.scrape_gnews(
+        "AAPL", days=400, end_date=datetime(2021, 12, 31, tzinfo=timezone.utc)
+    )
+    # Two queries return the same fixture. Both copies must be inside the window.
+    assert articles
+    assert {item[1] for item in articles} == {"in range"}
+
+
+def test_historical_news_does_not_call_gnews(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise AssertionError("GNews must not be used for historical news")
+
+    monkeypatch.setattr(scraper, "scrape_gnews", _boom)
+    monkeypatch.setattr(
+        scraper,
+        "scrape_alpaca_news",
+        lambda *args, **kwargs: (("AAPL", "N/A", "N/A"), [["kept"]]),
+    )
+    _, articles = scraper.scrape_historical_news(
+        "AAPL", days=30, end_date=datetime(2021, 1, 1, tzinfo=timezone.utc)
+    )
+    assert articles == [["kept"]]
+
+
 def test_config_import_does_not_require_keys():
     """Importing config with an empty environment must not raise."""
     import os
