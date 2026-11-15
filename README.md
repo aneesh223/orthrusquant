@@ -347,7 +347,7 @@ python backtester/run_backtest.py AMZN v 2014-01-01 2024-01-01
 
 The `batch_backtest.py` tool uses randomized periods (30-365 days) by default for **diversity testing** - checking behavior across market conditions. `--optimal-periods` switches to the longer strategy-aware windows above (momentum 3-5 years, value 5-10 years).
 
-The ticker universe in `TICKER_POOLS` (`backtester/batch_backtest.py`) is fixed in advance. Tickers are not added or dropped based on how a backtest turned out. Zoom's listing is `ZM` (there is no `ZOOM` ticker).
+The ticker universe in `TICKER_POOLS` (`backtester/batch_backtest.py`) is today's well-known survivors, chosen with hindsight, so it carries survivorship bias. Each ticker is in one pool. Zoom's listing is `ZM` (there is no `ZOOM` ticker).
 
 `--split-date YYYY-MM-DD` or `--train-ratio 0.7` freezes the adaptive threshold adjustment on the earlier part of each window and reports the held-out dates separately. `--seed 0` is a real seed. Results, including the seed and parameters, are written to `batch_results.json` and `batch_results.csv`.
 

@@ -7,6 +7,8 @@ Features parallel execution with configurable threading for faster batch process
 
 import csv
 import json
+import re
+import statistics
 import sys
 import os
 import random
@@ -91,9 +93,9 @@ def get_random_date_range(strategy=None, optimal_periods=False):
     
     return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
 
-# Fixed in advance of any backtest result. Names are not added or removed
-# because a past run looked good or bad. ZOOM is not a listed ticker; the
-# Zoom Video Communications listing is ZM.
+# Well-known names that are still listed. Choosing them after the fact is
+# survivorship bias: delisted and forgotten companies are not in the pools.
+# Each ticker is in exactly one pool. Zoom's listing is ZM, not ZOOM.
 TICKER_POOLS = {
     'mega_cap_tech': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'],
     'large_cap_tech': ['NFLX', 'ADBE', 'CRM', 'ORCL', 'INTC', 'AMD', 'AVGO'],
@@ -102,7 +104,7 @@ TICKER_POOLS = {
     'consumer': ['KO', 'PEP', 'WMT', 'HD', 'MCD', 'NKE', 'SBUX'],
     'energy': ['XOM', 'CVX', 'COP', 'EOG', 'SLB', 'MPC', 'VLO'],
     'industrials': ['BA', 'CAT', 'GE', 'MMM', 'HON', 'UPS', 'RTX'],
-    'volatile_growth': ['TSLA', 'NVDA', 'AMD', 'NFLX', 'ZM', 'ROKU', 'PLTR'],
+    'volatile_growth': ['ZM', 'ROKU', 'PLTR'],
 }
 
 # Strategy-aware windows used by --optimal-periods. Diversity mode stays short.
@@ -188,18 +190,49 @@ def summarize_result(result):
     return row
 
 
+def _zero_sentiment_coverage(row):
+    coverage = row.get("sentiment_coverage_pct")
+    if coverage is None:
+        return False
+    try:
+        return float(coverage) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def aggregate_percent_alpha(results):
-    alphas = [
-        r["percent_alpha"] for r in results
-        if r.get("success") and r.get("percent_alpha") is not None
+    """Headline mean excludes failed runs and runs with no sentiment coverage.
+
+    Zero-coverage runs (including the sub-7-day fast path) are counted on
+    their own. Failed runs contribute their reasons, not a made-up alpha.
+    """
+    failed = [row for row in results if not row.get("success")]
+    zero_coverage = [
+        row for row in results
+        if row.get("success") and _zero_sentiment_coverage(row)
     ]
-    if not alphas:
-        return {"count": 0, "mean_percent_alpha": None, "positive_alpha": 0}
-    return {
+    alphas = [
+        row["percent_alpha"] for row in results
+        if row.get("success")
+        and row.get("percent_alpha") is not None
+        and not _zero_sentiment_coverage(row)
+    ]
+    summary = {
         "count": len(alphas),
-        "mean_percent_alpha": sum(alphas) / len(alphas),
+        "mean_percent_alpha": None,
+        "std_percent_alpha": None,
+        "median_percent_alpha": None,
         "positive_alpha": sum(1 for value in alphas if value > 0),
+        "failed_count": len(failed),
+        "failure_reasons": [row.get("error") or "unknown" for row in failed],
+        "zero_coverage_count": len(zero_coverage),
     }
+    if not alphas:
+        return summary
+    summary["mean_percent_alpha"] = sum(alphas) / len(alphas)
+    summary["median_percent_alpha"] = float(statistics.median(alphas))
+    summary["std_percent_alpha"] = float(statistics.stdev(alphas)) if len(alphas) > 1 else 0.0
+    return summary
 
 
 def write_batch_results(path_prefix, results, seed, params):
@@ -426,15 +459,25 @@ def main():
                 print(f"   Period: {result['period']}")
                 print()
         
-        summary = aggregate_percent_alpha(successful_results)
+        summary = aggregate_percent_alpha(results)
         momentum = [r['percent_alpha'] for r in successful_results if r.get('strategy') in ('M', 'MOMENTUM') and r.get('percent_alpha') is not None]
         value = [r['percent_alpha'] for r in successful_results if r.get('strategy') in ('V', 'VALUE') and r.get('percent_alpha') is not None]
         
         print(f"\nOVERALL STATISTICS")
         print("-" * 40)
+        print(f"Failed runs: {summary['failed_count']}")
+        if summary["failure_reasons"]:
+            reasons = [
+                re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", str(reason))
+                for reason in summary["failure_reasons"]
+            ]
+            print(f"Failure reasons: {', '.join(reasons)}")
+        print(f"Zero-coverage runs excluded from the mean: {summary['zero_coverage_count']}")
         if summary["count"]:
             mean_alpha = summary["mean_percent_alpha"]
             print(f"Average Percent Alpha: {mean_alpha:+.2f}%")
+            print(f"Std Percent Alpha: {summary['std_percent_alpha']:.2f}")
+            print(f"Median Percent Alpha: {summary['median_percent_alpha']:+.2f}%")
             print(f"Positive Alpha: {summary['positive_alpha']}/{summary['count']} ({summary['positive_alpha']/summary['count']*100:.1f}%)")
             if momentum:
                 print(f"Momentum Strategy Avg: {sum(momentum)/len(momentum):+.2f}% ({len(momentum)} tests)")
@@ -453,7 +496,7 @@ def main():
         "optimal_periods": args.optimal_periods,
         "split_date": args.split_date,
         "train_ratio": args.train_ratio,
-        "ticker_universe": "fixed in advance; see TICKER_POOLS",
+        "ticker_universe": "survivorship-biased; each name is in one pool; see TICKER_POOLS",
     }
     json_path, csv_path = write_batch_results(args.output, results, args.seed, params)
     print(f"\nWrote {json_path} and {csv_path}")
