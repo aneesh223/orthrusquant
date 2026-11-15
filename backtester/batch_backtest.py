@@ -292,9 +292,9 @@ def main():
     parser.add_argument('--optimal-periods', action='store_true',
                        help='Sample long strategy-aware windows (momentum 3-5y, value 5-10y)')
     parser.add_argument('--split-date', default=None,
-                       help='YYYY-MM-DD held-out start. Thresholds are tuned before this date')
+                       help='YYYY-MM-DD held-out start. Freezes the adaptive threshold adjustment before this date')
     parser.add_argument('--train-ratio', type=float, default=None,
-                       help='Fraction of each window used to tune thresholds; the rest is held out')
+                       help='Fraction of each window used to freeze the adaptive threshold adjustment; the rest is held out')
     
     args = parser.parse_args()
     

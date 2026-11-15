@@ -349,7 +349,13 @@ The `batch_backtest.py` tool uses randomized periods (30-365 days) by default fo
 
 The ticker universe in `TICKER_POOLS` (`backtester/batch_backtest.py`) is fixed in advance. Tickers are not added or dropped based on how a backtest turned out. Zoom's listing is `ZM` (there is no `ZOOM` ticker).
 
-`--split-date YYYY-MM-DD` or `--train-ratio 0.7` tunes thresholds on the earlier part of each window and reports return, CAGR, Sharpe, drawdown, and trade count on the held-out dates only. `--seed 0` is a real seed. Results, including the seed and parameters, are written to `batch_results.json` and `batch_results.csv`.
+`--split-date YYYY-MM-DD` or `--train-ratio 0.7` freezes the adaptive threshold adjustment on the earlier part of each window and reports the held-out dates separately. `--seed 0` is a real seed. Results, including the seed and parameters, are written to `batch_results.json` and `batch_results.csv`.
+
+### What the train/test split does and does not hold out
+
+The split freezes only the small volatility adjustment on the buy and sell thresholds (the ±10% band computed from scores before the split). It then resets the book and reports the later dates.
+
+It does not hold out the base thresholds, the regime rules, position sizing, or the stop and target parameters. Those were chosen by hand. See the `OPTIMIZATION V7` and `OPTIMIZATION V8` notes in `src/constants.py` and `src/logic.py`. `PARAMS_LAST_CHANGED` in `src/constants.py` is 2026-03-26, the date of commit `e805e3f`, the last change on main to that logic. If the evaluation window starts on or before that date, the run sets `params_tuned_on_eval_window` and prints a notice: those choices were made with this history in view. The split is not a search over parameters.
 
 ```bash
 # Diverse testing (30-365 days, multiple scenarios)

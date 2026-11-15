@@ -43,6 +43,7 @@ except ImportError:  # script-style launch puts this directory on sys.path
         performance_metrics,
         sell_fill,
     )
+from src.constants import PARAMS_LAST_CHANGED
 from src.logic import (
     detect_market_regime,
     get_adaptive_risk_params,
@@ -905,8 +906,9 @@ class AlpacaBacktester:
                     print(f"Warning: Invalid price for {simulation_date.date()}, skipping...")
                     continue
 
-                # Tune on the dates before split_date, then reset the book and
-                # freeze those thresholds for the held-out sessions.
+                # Freeze the adaptive threshold adjustment from the dates before
+                # split_date, then reset the book. This does not retune the
+                # hand-set base thresholds or the regime and risk parameters.
                 if split_ts is not None and not test_started and simulation_date >= split_ts:
                     frozen_thresholds = self.calculate_adaptive_thresholds(
                         score_history, current_market_regime
@@ -1163,6 +1165,21 @@ class AlpacaBacktester:
         coverage = sentiment_coverage(
             eval_days, observation_dates, self.sentiment_freshness_days
         )
+        eval_start_day = _as_calendar_date(eval_days[0]) if eval_days else _as_calendar_date(start_date)
+        params_tuned_on_eval_window = eval_start_day <= PARAMS_LAST_CHANGED
+        if params_tuned_on_eval_window:
+            # filterwarnings("ignore") swallows warnings.warn, so print as well.
+            warnings.warn(
+                "Evaluation window starts on or before PARAMS_LAST_CHANGED "
+                f"({PARAMS_LAST_CHANGED.isoformat()}, commit e805e3f). "
+                "Hand-tuned parameters are not held out of this window.",
+                stacklevel=2,
+            )
+            print(
+                "NOTICE: evaluation starts on or before "
+                f"{PARAMS_LAST_CHANGED.isoformat()} (commit e805e3f). "
+                "Hand-tuned parameters overlap this window and are not held out."
+            )
         
         results = {
             'ticker': self.ticker,
@@ -1206,6 +1223,7 @@ class AlpacaBacktester:
             'frozen_sell_threshold': None if frozen_thresholds is None else frozen_thresholds[1],
             'train_num_trades': len(train_trade_log),
             'train_trade_log': train_trade_log,
+            'params_tuned_on_eval_window': params_tuned_on_eval_window,
             **coverage,
         }
         
