@@ -259,7 +259,6 @@ def _frozen_datetime(fixed):
 
 
 @pytest.mark.parametrize("strategy", ["momentum", "value"])
-@pytest.mark.xfail(strict=True, reason="wall clock, fixed in item 1")
 def test_d_results_do_not_depend_on_the_wall_clock(monkeypatch, strategy):
     prices = make_prices(3, start="2024-11-01")
     assert prices.index[-1] < pd.Timestamp("2026-11-01", tz="UTC")

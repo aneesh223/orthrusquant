@@ -769,7 +769,10 @@ class AlpacaBacktester:
                     sentiment_df=full_sentiment_df,
                     strategy=self.strategy,
                     lookback_days=simulation_days + 210,
-                    custom_date=None,  # Use end date as reference
+                    # Anchor the price window to the backtest end. None uses
+                    # datetime.now(), so the same history would score differently
+                    # on a later day.
+                    custom_date=end_date,
                     price_data=self.full_price_data  # Use full price data
                 )
                 

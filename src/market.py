@@ -611,6 +611,8 @@ def _filter_stock_data(stock_data, lookback_days, custom_date):
     """Optimized stock data filtering helper function with robust timezone handling for Alpaca data"""
     if lookback_days <= 1:
         # For 1-day analysis, filter to only that specific day
+        # Backtests pass custom_date so a one-day slice stays on that session.
+        # datetime.now() is only the default for a live, one-day run.
         target_date = custom_date.date() if custom_date else datetime.now().date()
         
         if not stock_data.empty:
