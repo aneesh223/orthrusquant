@@ -36,8 +36,15 @@ def _ensure_model():
             
             logging.info("Loading DistilRoBERTa financial sentiment model...")
             model_name = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
-            _ai_tokenizer = AutoTokenizer.from_pretrained(model_name)
-            _ai_model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            # Commit that contains model.safetensors for this repo. Pinning the
+            # revision stops a later upload from changing the weights we load.
+            model_revision = "ae0eab9ad336d7d548e0efe394b07c04bcaf6e91"
+            _ai_tokenizer = AutoTokenizer.from_pretrained(
+                model_name, revision=model_revision, use_safetensors=True
+            )
+            _ai_model = AutoModelForSequenceClassification.from_pretrained(
+                model_name, revision=model_revision, use_safetensors=True
+            )
             
             if torch.cuda.is_available():
                 device = torch.device("cuda")

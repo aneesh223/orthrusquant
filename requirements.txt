@@ -16,23 +16,23 @@ gnews==0.8.3
 
 # Hybrid sentiment analysis: VADER + DistilRoBERTa
 vaderSentiment==3.3.2
-transformers==4.46.3
+transformers==5.23.0
 
-# Default torch wheel is the CPU build so CI and a fresh install do not pull
-# CUDA. For NVIDIA CUDA 11.8, install explicitly:
-#   pip install torch==2.4.1+cu118 torchvision==0.19.1+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.4.1
-torchvision==0.19.1
+# PyPI wheels. torch 2.15.0 and torchvision 0.29.1 both publish cp312 wheels.
+# torchvision 0.29.1 requires torch>=2.14. For a CUDA build, install a matched
+# pair from https://pytorch.org/get-started/locally/ instead of these pins.
+torch==2.15.0
+torchvision==0.29.1
 
 # Utilities
 pytz==2024.2
-python-dotenv==1.0.1
+python-dotenv==1.2.4
 tqdm==4.67.1
 
 # Visualization
 matplotlib==3.9.4
 
 # Tests (no network; set ALPACA_API_KEY and ALPACA_SECRET_KEY to dummy values)
-pytest==8.3.5
+pytest==9.2.0
 pytest-socket==0.8.1
 hypothesis==6.131.0
