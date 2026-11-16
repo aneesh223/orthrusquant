@@ -1,5 +1,8 @@
 import matplotlib
-matplotlib.use('TkAgg')  # Use TkAgg backend for better macOS compatibility
+try:
+    matplotlib.use('TkAgg')  # Interactive windows when Tk is installed
+except Exception:
+    matplotlib.use('Agg')  # Headless fallback so imports do not require Tk
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd

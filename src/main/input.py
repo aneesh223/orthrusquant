@@ -1,8 +1,19 @@
 from datetime import datetime, timedelta
 import pytz
+import re
 import sys
 import os
 import logging
+
+# C0/C1 controls, including ESC and BEL. Tabs and newlines are left alone.
+_TERMINAL_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def strip_terminal_controls(value):
+    """Drop bytes a provider could use to rewrite the terminal."""
+    if value is None:
+        return ""
+    return _TERMINAL_CONTROLS.sub("", str(value))
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -76,41 +87,63 @@ def analyze_stock(ticker, lookback_days, strategy_mode):
     verdict = market.calculate_verdict(ticker, sentiment_df, strategy_mode.lower(), lookback_days)
     
     if verdict:
-        # Get trading recommendation using backtester-proven logic
+        # Get trading recommendation using the same signal code as the backtester
         trading_rec = market.get_trading_recommendation(ticker, verdict['Final_Buy_Score'], sentiment_df, strategy=strategy_mode)
-        
-        print("\n" + "="*50)
-        print(f"   ANALYSIS FOR {company_name} ({ticker})")
-        print("="*50)
-        print(f"Industry:   {industry}")
-        print(f"Market Cap: {mkt_cap}")
-        print("-" * 50)
-        print(f"Strategy:           {verdict['Strategy']}")
-        print(f"Market Sentiment:   {verdict['Sentiment_Health']:.1f}/10")
-        print(f"Market Analysis:    {verdict['Technical_Score']:.1f}/10")
-        print("-" * 50)
-        print(f"FINAL BUY SCORE:    {verdict['Final_Buy_Score']:.1f}/10")
-        
-        # Display trading recommendation with market regime
-        rec_color = "🟢" if trading_rec['recommendation'] == "BUY" else "🔴" if trading_rec['recommendation'] == "SELL" else "🟡"
-        print(f"TRADING SIGNAL:     {rec_color} {trading_rec['recommendation']} ({trading_rec['confidence']:.0f}% confidence)")
-        print(f"Market Regime:      {trading_rec['market_regime']}")
-        
-        # Display adaptive thresholds
-        risk_params = trading_rec['risk_params']
-        print(f"Adaptive Thresholds: Buy≥{trading_rec['buy_threshold']:.3f}, Sell≤{trading_rec['sell_threshold']:.3f}")
-        print(f"Risk Management:    Stop-loss {risk_params['stop_loss_pct']*100:+.0f}%, Take-profit {risk_params['take_profit_pct']*100:+.0f}%")
-        
-        print(f"\nREASONING:\n{verdict['Explanation']}")
-        print(f"Signal Logic: {trading_rec['reasoning']}")
-        print("-" * 50)
-        print(f"TOP POSITIVE NEWS:\n>> {best_news}")
-        print(f"\nTOP NEGATIVE NEWS:\n>> {worst_news}")
-        print("="*50 + "\n")
-    
+        print_analysis_report(
+            company_name=company_name,
+            ticker=ticker,
+            industry=industry,
+            mkt_cap=mkt_cap,
+            verdict=verdict,
+            trading_rec=trading_rec,
+            best_news=best_news,
+            worst_news=worst_news,
+        )
+
     # Generate visualization
     final_df = market.get_visualization_data(ticker, sentiment_df, lookback_days)
     visualizer.plot_graph(ticker, final_df, profile_data, lookback_days, strategy_mode)
+
+
+def print_analysis_report(*, company_name, ticker, industry, mkt_cap, verdict, trading_rec, best_news, worst_news):
+    """Print the analysis. Provider strings are stripped of terminal controls."""
+    company_name = strip_terminal_controls(company_name)
+    ticker = strip_terminal_controls(ticker)
+    industry = strip_terminal_controls(industry)
+    mkt_cap = strip_terminal_controls(mkt_cap)
+    best_news = strip_terminal_controls(best_news)
+    worst_news = strip_terminal_controls(worst_news)
+    explanation = strip_terminal_controls(verdict.get("Explanation"))
+    reasoning = strip_terminal_controls(trading_rec.get("reasoning"))
+    regime = strip_terminal_controls(trading_rec.get("market_regime"))
+    recommendation = strip_terminal_controls(trading_rec.get("recommendation"))
+
+    print("\n" + "="*50)
+    print(f"   ANALYSIS FOR {company_name} ({ticker})")
+    print("="*50)
+    print(f"Industry:   {industry}")
+    print(f"Market Cap: {mkt_cap}")
+    print("-" * 50)
+    print(f"Strategy:           {verdict['Strategy']}")
+    print(f"Market Sentiment:   {verdict['Sentiment_Health']:.1f}/10")
+    print(f"Market Analysis:    {verdict['Technical_Score']:.1f}/10")
+    print("-" * 50)
+    print(f"FINAL BUY SCORE:    {verdict['Final_Buy_Score']:.1f}/10")
+
+    rec_color = "🟢" if recommendation == "BUY" else "🔴" if recommendation == "SELL" else "🟡"
+    print(f"TRADING SIGNAL:     {rec_color} {recommendation} ({trading_rec['confidence']:.0f}% confidence)")
+    print(f"Market Regime:      {regime}")
+
+    risk_params = trading_rec['risk_params']
+    print(f"Adaptive Thresholds: Buy≥{trading_rec['buy_threshold']:.3f}, Sell≤{trading_rec['sell_threshold']:.3f}")
+    print(f"Risk Management:    Stop-loss {risk_params['stop_loss_pct']*100:+.0f}%, Take-profit {risk_params['take_profit_pct']*100:+.0f}%")
+
+    print(f"\nREASONING:\n{explanation}")
+    print(f"Signal Logic: {reasoning}")
+    print("-" * 50)
+    print(f"TOP POSITIVE NEWS:\n>> {best_news}")
+    print(f"\nTOP NEGATIVE NEWS:\n>> {worst_news}")
+    print("="*50 + "\n")
 
 def main():
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")

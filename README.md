@@ -65,7 +65,7 @@ The CNN is a sketch, not a trained model. Weights would live at `models/orderboo
 - **Point-in-time simulation**: Technicals use only bars up to that session, news is aggregated oldest-first, and orders fill at the next open. Sentiment coverage is reported because days with no article still fall back to a neutral score.
 - **Advanced Risk Management**: Adaptive stop-loss, take-profit, and trailing stops based on market regime
 - **Market Regime Detection**: Automatic adaptation to BULL/BEAR/SIDEWAYS markets with volatility tolerance
-- **Performance Analytics**: Fair buy-and-hold comparison (always starts Day 1) with alpha calculation
+- **Performance Analytics**: Buy-and-hold enters at the second session's open, the first fill the strategy could get
 - **Bull Market Optimization**: Volatility tolerance system for maximum bull market participation
 - **CLI Interface**: Streamlined command-line backtesting with comprehensive batch testing
 
@@ -214,7 +214,7 @@ The hybrid approach combines two sentiment models:
 ### **Security Best Practices**
 - API keys are loaded via environment variables (secure)
 - `.env` file is in `.gitignore` (not committed to repo)
-- Uses paper trading endpoint (no real money at risk)
+- Only Alpaca market-data and news endpoints are used. There is no paper or live trading.
 - **Never commit real API keys to version control**
 
 ## Installation
@@ -274,7 +274,7 @@ The hybrid approach combines two sentiment models:
 
 ## Optimal Backtesting Timeframes
 
-**Critical**: Different strategies require different testing periods to validate their mathematical edge. Using the wrong timeframe will produce misleading results.
+**Critical**: Different strategies are usually looked at over different lengths of history. A short window can be a misleading sample.
 
 ### MOMENTUM Strategy: 3-5 Years (Recommended: 5 Years)
 
@@ -288,7 +288,7 @@ The hybrid approach combines two sentiment models:
    
    This tests the dynamic threshold system across all market regimes.
 
-3. **Statistical Significance**: Momentum swing trades trigger less frequently than high-frequency strategies. A 3-5 year window guarantees 100+ trades per ticker, providing the sample size needed to prove the mathematical edge.
+3. **Sample size**: Momentum swing trades trigger less often than a high-frequency strategy. A longer window usually produces more trades, but it does not guarantee any particular count.
 
 **Implementation:**
 ```bash
