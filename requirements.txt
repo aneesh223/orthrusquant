@@ -34,4 +34,5 @@ matplotlib==3.9.4
 
 # Tests (no network; set ALPACA_API_KEY and ALPACA_SECRET_KEY to dummy values)
 pytest==8.3.5
+pytest-socket==0.8.1
 hypothesis==6.131.0
