@@ -1,7 +1,7 @@
 import pandas as pd
 import yfinance as yf
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, date, time, timedelta
 import pytz
 from functools import lru_cache
 from threading import Lock
@@ -322,6 +322,70 @@ def calculate_momentum_score(macd_line, signal_line, histogram, bullish_crossove
     
     return technical_score, explanation
 
+def _as_utc_timestamp(value):
+    """Convert a sentiment key to a tz-aware UTC timestamp.
+
+    ``datetime.date`` keys come from ``Series.dt.date`` and stand for a whole
+    session. They are placed at the end of that UTC day so the session's bar
+    is included and the next session is not.
+    """
+    if isinstance(value, datetime):
+        ts = pd.Timestamp(value)
+    elif isinstance(value, date):
+        ts = pd.Timestamp(datetime.combine(value, time.max))
+    else:
+        ts = pd.Timestamp(value)
+
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def _utc_close_series(prices):
+    """Sort closes and force a UTC DatetimeIndex.
+
+    A non-datetime index is rejected. Comparing it with ``except: use all
+    prices`` is what let MACD, RSI, and the moving averages see future bars.
+    """
+    if not isinstance(prices.index, pd.DatetimeIndex):
+        raise TypeError(
+            "Price index must be a DatetimeIndex so each score can be cut off "
+            f"at that session. Got {type(prices.index).__name__}. "
+            "Refusing to score technicals on an unaligned series."
+        )
+    aligned = prices.sort_index()
+    if aligned.index.tz is None:
+        aligned = aligned.copy()
+        aligned.index = aligned.index.tz_localize("UTC")
+    else:
+        aligned = aligned.copy()
+        aligned.index = aligned.index.tz_convert("UTC")
+    return aligned
+
+
+def _prices_through(prices, as_of):
+    """Closes at or before ``as_of``. Alignment failures raise.
+
+    Falling back to the uncut series would leak every later bar into the
+    technical score for this timestamp.
+    """
+    if not isinstance(as_of, pd.Timestamp):
+        as_of = _as_utc_timestamp(as_of)
+    elif as_of.tzinfo is None:
+        as_of = as_of.tz_localize("UTC")
+    else:
+        as_of = as_of.tz_convert("UTC")
+    try:
+        return prices.loc[:as_of]
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "Price/sentiment alignment failed "
+            f"(as_of={as_of!r}, index dtype={getattr(prices.index, 'dtype', type(prices.index))}). "
+            "Refusing to compute MACD/RSI/SMA on the full series because that "
+            "includes future bars."
+        ) from exc
+
+
 def calculate_verdict(ticker, sentiment_df, strategy="value", lookback_days=30, custom_date=None, price_data=None):
     """Calculate trading verdict with B(t) calculation and rolling window Final_Buy_Scores
     
@@ -367,6 +431,14 @@ def calculate_verdict(ticker, sentiment_df, strategy="value", lookback_days=30, 
             'Explanation': "No stock price data available for technical analysis.",
             'Strategy': "N/A"
         }
+
+    # Reject an unaligned index before any slice. The old fallback used every
+    # bar, including sessions after the sentiment date.
+    if not isinstance(stock_data.index, pd.DatetimeIndex):
+        raise TypeError(
+            "Price index must be a DatetimeIndex so each score can be cut off "
+            f"at that session. Got {type(stock_data.index).__name__}."
+        )
     
     # Date filtering (still apply filtering logic even with injected data)
     stock_data_filtered = _filter_stock_data(stock_data, lookback_days, custom_date)
@@ -374,44 +446,39 @@ def calculate_verdict(ticker, sentiment_df, strategy="value", lookback_days=30, 
     if stock_data_filtered.empty:
         stock_data_filtered = stock_data
     
-    # Get closing prices for technical analysis
-    prices = stock_data_filtered['Close']
+    # Get closing prices for technical analysis. UTC timestamps make the
+    # cutoff comparison with sentiment dates well-defined.
+    prices = _utc_close_series(stock_data_filtered['Close'])
     strategy_name = "MOMENTUM" if strategy.lower() == "momentum" else "VALUE"
+
+    # Normalize sentiment keys (often bare datetime.date objects) to tz-aware
+    # UTC and sort oldest-first. The rolling window assumes that order.
+    sentiment_work = sentiment_df.copy()
+    try:
+        sentiment_work.index = pd.DatetimeIndex(
+            [_as_utc_timestamp(ts) for ts in sentiment_work.index]
+        )
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "Sentiment index could not be converted to tz-aware timestamps. "
+            "Refusing to fall back to the full price series."
+        ) from exc
+    sentiment_work = sentiment_work.sort_index()
     
     # Calculate all B(t) values first (one pass through sentiment data)
     buy_scores_at_t = []  # List of (timestamp, B(t)) tuples
     
-    logging.info(f"Calculating B(t) values for {len(sentiment_df)} time periods...")
+    logging.info(f"Calculating B(t) values for {len(sentiment_work)} time periods...")
     
-    for timestamp, row in sentiment_df.iterrows():
+    for timestamp, row in sentiment_work.iterrows():
         sentiment_score = row['Compound_Score']
         sentiment_health = (sentiment_score + 1) * 5  # Convert to 0-10 scale
-        
-        # Handle timezone-aware comparisons for price data
-        if hasattr(timestamp, 'tz_localize') and timestamp.tz is None:
-            # Make timestamp timezone-aware to match price data
-            if not prices.index.empty and prices.index.tz is not None:
-                timestamp_tz = timestamp.tz_localize(prices.index.tz)
-            else:
-                timestamp_tz = timestamp
-        elif hasattr(timestamp, 'tz_convert') and timestamp.tz is not None:
-            # Convert to price data timezone if needed
-            if not prices.index.empty and prices.index.tz is not None:
-                timestamp_tz = timestamp.tz_convert(prices.index.tz)
-            else:
-                timestamp_tz = timestamp.tz_localize(None)  # Remove timezone
-        else:
-            timestamp_tz = timestamp
+        timestamp_tz = timestamp if isinstance(timestamp, pd.Timestamp) else _as_utc_timestamp(timestamp)
         
         # Get technical score at time t (using price data up to that point)
+        price_data_up_to_t = _prices_through(prices, timestamp_tz)
         if strategy.lower() == "momentum":
             # For momentum, use recent price data up to time t
-            try:
-                price_data_up_to_t = prices[prices.index <= timestamp_tz]
-            except (TypeError, ValueError):
-                # Fallback: use all price data if comparison fails
-                price_data_up_to_t = prices
-                
             if len(price_data_up_to_t) >= 200:  # Need enough data for Golden/Death Cross
                 # Calculate Golden/Death Cross
                 cross_score, golden_cross, death_cross, sma_short, sma_long = calculate_golden_death_cross(price_data_up_to_t)
@@ -433,12 +500,6 @@ def calculate_verdict(ticker, sentiment_df, strategy="value", lookback_days=30, 
                 technical_score_t = 5.0  # Neutral if not enough data
         else:
             # For value, use Z-score up to time t
-            try:
-                price_data_up_to_t = prices[prices.index <= timestamp_tz]
-            except (TypeError, ValueError):
-                # Fallback: use all price data if comparison fails
-                price_data_up_to_t = prices
-                
             if len(price_data_up_to_t) >= 50:  # Need enough data for Z-score
                 z_score = calculate_z_score(price_data_up_to_t, window=50)
                 technical_score_t, _ = calculate_value_score(z_score)
@@ -450,7 +511,7 @@ def calculate_verdict(ticker, sentiment_df, strategy="value", lookback_days=30, 
         buy_score_t = ((technical_score_t * 0.6) + (sentiment_health * 0.4)) * sentiment_penalty
         buy_score_t = np.clip(buy_score_t, 1.0, 10.0)
         
-        buy_scores_at_t.append((timestamp, buy_score_t))
+        buy_scores_at_t.append((timestamp_tz, buy_score_t))
     
     if not buy_scores_at_t:
         return {
@@ -550,6 +611,8 @@ def _filter_stock_data(stock_data, lookback_days, custom_date):
     """Optimized stock data filtering helper function with robust timezone handling for Alpaca data"""
     if lookback_days <= 1:
         # For 1-day analysis, filter to only that specific day
+        # Backtests pass custom_date so a one-day slice stays on that session.
+        # datetime.now() is only the default for a live, one-day run.
         target_date = custom_date.date() if custom_date else datetime.now().date()
         
         if not stock_data.empty:
@@ -718,14 +781,14 @@ def get_visualization_data(ticker, sentiment_df, timeframe_days=30):
                         if timestamp in price_data.index:
                             price = price_data.loc[timestamp, 'Close']
                             buy_signals.append((timestamp, price))
-                    except:
+                    except (KeyError, TypeError, ValueError):
                         pass
                 elif row['Buy_Score'] < 4.0:
                     try:
                         if timestamp in price_data.index:
                             price = price_data.loc[timestamp, 'Close']
                             sell_signals.append((timestamp, price))
-                    except:
+                    except (KeyError, TypeError, ValueError):
                         pass
         
         # Resample price data to match sentiment frequency
@@ -807,7 +870,8 @@ def get_trading_recommendation(ticker: str, final_buy_score: float, sentiment_df
     try:
         stock = yf.Ticker(ticker)
         price_data = stock.history(period="6mo")  # 6 months for regime detection
-    except:
+    except Exception as exc:
+        logging.warning(f"Could not load price history for {ticker}: {exc}")
         price_data = None
     
     return shared_get_trading_recommendation(ticker, final_buy_score, sentiment_df, price_data, strategy=strategy)

@@ -1,5 +1,8 @@
 import matplotlib
-matplotlib.use('TkAgg')  # Use TkAgg backend for better macOS compatibility
+try:
+    matplotlib.use('TkAgg')  # Interactive windows when Tk is installed
+except Exception:
+    matplotlib.use('Agg')  # Headless fallback so imports do not require Tk
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
@@ -118,7 +121,7 @@ def plot_graph(ticker, merged_df, company_info, timeframe_days=30, strategy_mode
                     dt = pytz.utc.localize(dt)
                 dt_et = dt.astimezone(et_tz)
                 return dt_et.strftime('%m/%d %H:%M ET')
-            except:
+            except Exception:
                 return mdates.DateFormatter('%m/%d %H:%M')(x, pos)
         
         ax2.xaxis.set_major_formatter(plt.FuncFormatter(format_time_et))

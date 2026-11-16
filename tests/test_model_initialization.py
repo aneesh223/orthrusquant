@@ -80,8 +80,9 @@ def test_get_model_uses_cpu_when_cuda_unavailable():
     src.microstructure._model = None
     src.microstructure._device = None
     
-    # Mock torch.cuda.is_available to return False
-    with patch('torch.cuda.is_available', return_value=False):
+    # CUDA and MPS both have to be off. On Apple Silicon, MPS would win.
+    with patch('torch.cuda.is_available', return_value=False), \
+         patch('torch.backends.mps.is_available', return_value=False):
         model, device = _get_model()
         
         # Verify device is cpu

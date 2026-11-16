@@ -2,13 +2,21 @@
 Constants for Orthrus trading logic.
 """
 
+from datetime import date
+
+# Last commit on main that changed src/logic.py, src/constants.py, src/market.py,
+# or backtester/backtester.py. Checked with:
+# git log main -1 --date=short -- src/logic.py src/constants.py src/market.py backtester/backtester.py
+# e805e3f on this date.
+PARAMS_LAST_CHANGED = date(2026, 3, 26)
+
 # SECTOR-AWARE THRESHOLD ADJUSTMENTS
 # Adjustment to buy threshold based on sector/stock characteristics
 # Negative = more aggressive (lower threshold), Positive = more conservative (higher threshold)
 SECTOR_THRESHOLDS = {
     # Volatile Growth - Ultra aggressive (fast movers, sentiment lags)
     'TSLA': -0.20, 'NVDA': -0.20, 'AMD': -0.20, 'ROKU': -0.20,
-    'PLTR': -0.20, 'ZOOM': -0.20, 'NFLX': -0.15,
+    'PLTR': -0.20, 'ZM': -0.20, 'NFLX': -0.15,
 
     # Mega Cap Tech - Very aggressive (tech rallies are fast)
     'AAPL': -0.15, 'MSFT': -0.15, 'GOOGL': -0.15,

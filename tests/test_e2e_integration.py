@@ -13,7 +13,7 @@ import numpy as np
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta
 
-from src.market import get_intraday_data
+from src import market
 from src.microstructure import analyze_liquidity, df_to_heatmap
 from src.logic import get_trading_recommendation
 
@@ -31,101 +31,105 @@ class TestEndToEndIntegration:
         """
         Test full flow: ticker → intraday data → heatmap → CNN → recommendation adjustment.
         
-        Uses real yfinance data for a known ticker (AAPL) to verify all components
-        work together correctly.
+        Uses a local intraday frame. The suite blocks sockets, so this does not
+        call Yahoo.
         
         **Validates: All requirements**
         """
         ticker = "AAPL"
-        
-        # Clear cache to ensure fresh data
-        get_intraday_data.cache_clear()
-        
+        dates = pd.date_range(start="2024-01-02 09:30", periods=120, freq="1min")
+        local_df = pd.DataFrame(
+            {
+                "Open": [150 + i * 0.05 for i in range(120)],
+                "High": [150.4 + i * 0.05 for i in range(120)],
+                "Low": [149.6 + i * 0.05 for i in range(120)],
+                "Close": [150.1 + i * 0.05 for i in range(120)],
+                "Volume": [1000 + i * 10 for i in range(120)],
+            },
+            index=dates,
+        )
+
         try:
-            # Step 1: Fetch intraday data
-            df = get_intraday_data(ticker)
+            with patch("src.market.get_intraday_data", return_value=local_df):
+                df = market.get_intraday_data(ticker)
             
-            # Verify data was fetched
-            assert df is not None, "Intraday data should not be None"
+                # Verify data was fetched
+                assert df is not None, "Intraday data should not be None"
             
-            # If no data available (market closed, API issue), skip test
-            if df.empty:
-                pytest.skip("No intraday data available for AAPL - market may be closed")
+                # Verify data structure
+                assert 'High' in df.columns, "Data should have High column"
+                assert 'Low' in df.columns, "Data should have Low column"
+                assert 'Volume' in df.columns, "Data should have Volume column"
             
-            # Verify data structure
-            assert 'High' in df.columns, "Data should have High column"
-            assert 'Low' in df.columns, "Data should have Low column"
-            assert 'Volume' in df.columns, "Data should have Volume column"
+                # Step 2: Convert to heatmap
+                heatmap = df_to_heatmap(df)
             
-            # Step 2: Convert to heatmap
-            heatmap = df_to_heatmap(df)
+                # Verify heatmap was generated
+                assert heatmap is not None, "Heatmap should not be None"
+                assert heatmap.shape == (64, 64), "Heatmap should be 64x64"
+                assert np.all(heatmap >= 0.0) and np.all(heatmap <= 1.0), \
+                    "Heatmap values should be in [0, 1]"
             
-            # Verify heatmap was generated
-            assert heatmap is not None, "Heatmap should not be None"
-            assert heatmap.shape == (64, 64), "Heatmap should be 64x64"
-            assert np.all(heatmap >= 0.0) and np.all(heatmap <= 1.0), \
-                "Heatmap values should be in [0, 1]"
+                # Step 3: Analyze liquidity (CNN inference)
+                result = analyze_liquidity(ticker)
             
-            # Step 3: Analyze liquidity (CNN inference)
-            result = analyze_liquidity(ticker)
+                # Verify analysis result
+                assert 'anomaly_score' in result, "Result should have anomaly_score"
+                assert 'status' in result, "Result should have status"
+                assert 'confidence' in result, "Result should have confidence"
             
-            # Verify analysis result
-            assert 'anomaly_score' in result, "Result should have anomaly_score"
-            assert 'status' in result, "Result should have status"
-            assert 'confidence' in result, "Result should have confidence"
+                # Verify anomaly score is in valid range
+                assert 0.0 <= result['anomaly_score'] <= 1.0, \
+                    f"Anomaly score should be in [0, 1], got {result['anomaly_score']}"
             
-            # Verify anomaly score is in valid range
-            assert 0.0 <= result['anomaly_score'] <= 1.0, \
-                f"Anomaly score should be in [0, 1], got {result['anomaly_score']}"
+                # Verify status is one of the expected values
+                valid_statuses = [
+                    'Critical liquidity void detected',
+                    'High microstructure volatility',
+                    'Normal market conditions',
+                    'Strong accumulation zone detected',
+                    'Insufficient data for microstructure analysis'
+                ]
+                assert result['status'] in valid_statuses, \
+                    f"Status should be one of {valid_statuses}, got {result['status']}"
             
-            # Verify status is one of the expected values
-            valid_statuses = [
-                'Critical liquidity void detected',
-                'High microstructure volatility',
-                'Normal market conditions',
-                'Strong accumulation zone detected',
-                'Insufficient data for microstructure analysis'
-            ]
-            assert result['status'] in valid_statuses, \
-                f"Status should be one of {valid_statuses}, got {result['status']}"
+                # Step 4: Test recommendation adjustment
+                # Create mock sentiment data
+                sentiment_df = pd.DataFrame({
+                    'Compound_Score': [0.5] * 10
+                })
             
-            # Step 4: Test recommendation adjustment
-            # Create mock sentiment data
-            sentiment_df = pd.DataFrame({
-                'Compound_Score': [0.5] * 10
-            })
+                # Create mock price data
+                price_data = pd.DataFrame({
+                    'Close': [150 + i * 0.1 for i in range(100)]
+                }, index=pd.date_range(start='2024-01-01', periods=100, freq='1D'))
             
-            # Create mock price data
-            price_data = pd.DataFrame({
-                'Close': [150 + i * 0.1 for i in range(100)]
-            }, index=pd.date_range(start='2024-01-01', periods=100, freq='1D'))
+                # Get trading recommendation (should include microstructure adjustment)
+                recommendation = get_trading_recommendation(
+                    ticker=ticker,
+                    final_buy_score=6.0,  # BUY signal
+                    sentiment_df=sentiment_df,
+                    price_data=price_data,
+                    strategy='momentum'
+                )
             
-            # Get trading recommendation (should include microstructure adjustment)
-            recommendation = get_trading_recommendation(
-                ticker=ticker,
-                final_buy_score=6.0,  # BUY signal
-                sentiment_df=sentiment_df,
-                price_data=price_data,
-                strategy='momentum'
-            )
+                # Verify recommendation structure
+                assert 'recommendation' in recommendation, "Should have recommendation"
+                assert 'confidence' in recommendation, "Should have confidence"
+                assert 'reasoning' in recommendation, "Should have reasoning"
             
-            # Verify recommendation structure
-            assert 'recommendation' in recommendation, "Should have recommendation"
-            assert 'confidence' in recommendation, "Should have confidence"
-            assert 'reasoning' in recommendation, "Should have reasoning"
+                # Verify confidence is in valid range
+                assert 0 <= recommendation['confidence'] <= 100, \
+                    f"Confidence should be in [0, 100], got {recommendation['confidence']}"
             
-            # Verify confidence is in valid range
-            assert 0 <= recommendation['confidence'] <= 100, \
-                f"Confidence should be in [0, 100], got {recommendation['confidence']}"
-            
-            # Verify no exceptions were raised
-            print(f"✓ Full flow completed successfully for {ticker}")
-            print(f"  - Fetched {len(df)} minutes of intraday data")
-            print(f"  - Generated {heatmap.shape} heatmap")
-            print(f"  - Anomaly score: {result['anomaly_score']:.3f}")
-            print(f"  - Status: {result['status']}")
-            print(f"  - Recommendation: {recommendation['recommendation']}")
-            print(f"  - Confidence: {recommendation['confidence']:.1f}")
+                # Verify no exceptions were raised
+                print(f"✓ Full flow completed successfully for {ticker}")
+                print(f"  - Fetched {len(df)} minutes of intraday data")
+                print(f"  - Generated {heatmap.shape} heatmap")
+                print(f"  - Anomaly score: {result['anomaly_score']:.3f}")
+                print(f"  - Status: {result['status']}")
+                print(f"  - Recommendation: {recommendation['recommendation']}")
+                print(f"  - Confidence: {recommendation['confidence']:.1f}")
             
         except Exception as e:
             pytest.fail(f"End-to-end test failed with exception: {e}")
@@ -154,8 +158,8 @@ class TestEndToEndIntegration:
         
         # Mock get_intraday_data
         with patch('src.market.get_intraday_data', return_value=mock_df):
-            # Step 1: Fetch intraday data
-            df = get_intraday_data(ticker)
+            # Step 1: Fetch intraday data through the module the patch replaces.
+            df = market.get_intraday_data(ticker)
             assert not df.empty, "Should have data"
             
             # Step 2: Convert to heatmap

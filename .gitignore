@@ -48,6 +48,10 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
+
+# Local batch-backtest output
+batch_results.json
+batch_results.csv
 .pytest_cache/
 cover/
 

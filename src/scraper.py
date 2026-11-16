@@ -1,4 +1,3 @@
-import ssl
 import yfinance as yf
 from gnews import GNews
 from datetime import datetime, timedelta
@@ -7,15 +6,8 @@ from functools import lru_cache
 import concurrent.futures
 from threading import Lock
 import time
-import config
+from src import config
 import logging
-
-# SSL optimization
-try:
-    _create_unverified_https_context = ssl._create_unverified_context
-    ssl._create_default_https_context = _create_unverified_https_context
-except AttributeError:
-    pass
 
 # Thread-safe cache
 _profile_cache = {}
@@ -139,8 +131,9 @@ def scrape_alpaca_news(ticker, days=30, end_date=None):
                 if isinstance(created_at, str):
                     try:
                         created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    except:
-                        created_at = datetime.now(pytz.utc)
+                    except ValueError:
+                        logging.warning("Skipping Alpaca article with an unparseable timestamp")
+                        continue
                 
                 if created_at and headline:
                     parsed.append([created_at, headline, source])
@@ -157,7 +150,14 @@ def scrape_alpaca_news(ticker, days=30, end_date=None):
         return profile_data, []
 
 def scrape_gnews(ticker, days=30, end_date=None):
-    """Legacy GNews scraping logic with historical date support"""
+    """Live GNews lookup. Not a historical source.
+
+    ``GNews.get_news`` does not take a start or end, and Google News is not a
+    point-in-time archive (a ``before:`` hint is dropped once a query asks for
+    more than 100 hits). Articles published after ``end_date`` are discarded
+    here, but that only filters whatever the live search happened to return.
+    Backtests must call :func:`scrape_historical_news` instead.
+    """
     profile_data = get_profile_data(ticker)
     parsed = []
     
@@ -169,9 +169,11 @@ def scrape_gnews(ticker, days=30, end_date=None):
     
     cutoff_date = end_date - timedelta(days=days + 1)
 
-    # Helper to parse GNews dates
+    # Helper to parse GNews dates. Unparseable dates are dropped rather than
+    # stamped with "now", which would invent a current article.
     def _parse_gnews_date(date_str):
-        if not date_str: return datetime.now(pytz.utc)
+        if not date_str:
+            return None
         formats = ['%a, %d %b %Y %H:%M:%S GMT', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S']
         for fmt in formats:
             try:
@@ -185,26 +187,35 @@ def scrape_gnews(ticker, days=30, end_date=None):
                     return pytz.utc.localize(dt_obj)
             except ValueError:
                 continue
-        return datetime.now(pytz.utc)
+        return None
 
     try:
         google_news = GNews(language='en', country='US')
+        # Best-effort hint only. The client still ignores this for large result
+        # sets, so the loop below is what actually enforces the window.
+        try:
+            google_news.start_date = cutoff_date.replace(tzinfo=None)
+            google_news.end_date = end_date.replace(tzinfo=None)
+        except (TypeError, ValueError, AttributeError) as exc:
+            logging.warning(f"GNews client rejected the requested window: {exc}")
         search_queries = [f"{ticker} stock", f"{ticker} finance"]
         results = []
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(google_news.get_news, q) for q in search_queries]
             for f in concurrent.futures.as_completed(futures):
-                try: results.extend(f.result())
-                except: pass
+                try:
+                    results.extend(f.result())
+                except Exception as exc:
+                    logging.error(f"GNews query failed: {exc}")
         
         for item in results:
             title = item.get('title')
             date_str = item.get('published date')
             publisher = item.get('publisher', {}).get('title', 'Unknown')
             dt_obj = _parse_gnews_date(date_str)
-            
-            if dt_obj < cutoff_date: continue
+            if dt_obj is None or dt_obj < cutoff_date or dt_obj > end_date:
+                continue
             parsed.append([dt_obj, title, publisher])
             
         return profile_data, parsed
@@ -212,15 +223,27 @@ def scrape_gnews(ticker, days=30, end_date=None):
         logging.error(f"GNews Error: {e}")
         return profile_data, []
 
+def scrape_historical_news(ticker, days=30, end_date=None):
+    """News for backtests: Alpaca/Benzinga only, with an explicit start and end.
+
+    GNews is excluded. Its search API does not provide a reliable historical
+    window, so mixing it into a backtest pulls articles from outside the
+    simulated dates.
+    """
+    return scrape_alpaca_news(ticker, days=days, end_date=end_date)
+
+
 def scrape_hybrid(ticker, days=30, end_date=None):
     """
-    Combined scraper: Fetches from both Alpaca and Google News.
-    Uses deduplication and parallel processing.
-    
+    Live scraper: Alpaca plus Google News, deduplicated.
+
+    Do not use this for backtests. Use :func:`scrape_historical_news`, which
+    stays inside the requested start/end window.
+
     Args:
         ticker: Stock symbol
         days: Number of days to look back
-        end_date: End date for news search (defaults to now, supports historical backtesting)
+        end_date: End date for news search (defaults to now)
     """
     # Fetch from Alpaca (Fast, reliable, structured) - parallel execution
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:

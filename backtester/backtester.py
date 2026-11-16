@@ -27,6 +27,23 @@ parent_dir = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, parent_dir)
 
 from src import config, market, analyzer, scraper
+try:
+    from backtester.metrics import (
+        affordable_shares,
+        buy_and_hold_result,
+        buy_fill,
+        performance_metrics,
+        sell_fill,
+    )
+except ImportError:  # script-style launch puts this directory on sys.path
+    from metrics import (
+        affordable_shares,
+        buy_and_hold_result,
+        buy_fill,
+        performance_metrics,
+        sell_fill,
+    )
+from src.constants import PARAMS_LAST_CHANGED
 from src.logic import (
     detect_market_regime,
     get_adaptive_risk_params,
@@ -38,15 +55,146 @@ from src.logic import (
     detect_momentum_reversal
 )
 from typing import Dict, List, Tuple, Optional
+import bisect
 import warnings
 warnings.filterwarnings("ignore")
+
+# Regime is re-detected on this fixed cadence. Tying it to the length of the
+# window made a short replay of the same past update on different days.
+REGIME_UPDATE_INTERVAL = 10
+
+
+# Calendar days of price history fetched before the first simulated session.
+# The momentum path needs 200 trading bars for the Golden/Death Cross, which is
+# roughly 290 calendar days once weekends and holidays are removed.
+PRICE_WARMUP_CALENDAR_DAYS = 300
+
+
+def news_window_days(simulation_days: int, news_lookback_days: Optional[int] = None) -> int:
+    """How many days of news to request.
+
+    ``None`` means the whole simulation plus a short buffer, with no 90-day
+    cap. Pass an int to cap the request (the old behavior was a hard 90).
+    """
+    if news_lookback_days is None:
+        return max(1, int(simulation_days) + 10)
+    return max(1, int(news_lookback_days))
+
+
+def _as_utc_datetime(value):
+    """Normalize a split date to UTC. Bare dates start at midnight."""
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        value = datetime.combine(value, datetime.min.time())
+    if value.tzinfo is None:
+        return pytz.utc.localize(value)
+    return value.astimezone(pytz.utc)
+
+
+def _as_calendar_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if hasattr(value, "date") and not isinstance(value, datetime):
+        try:
+            return value.date()
+        except (TypeError, ValueError):
+            return value
+    return value
+
+
+# Same decay the rolling buy-score window uses. More recent rows weigh more.
+_SENTIMENT_DECAY = 0.5
+
+
+def fresh_sentiment(observations, day, freshness_days, decay=_SENTIMENT_DECAY):
+    """Recency-weighted compound for headlines whose UTC date is in [day-N+1, day].
+
+    Returns ``(compound, covered)``. No row in the window means a neutral
+    compound of 0.0 and covered=False. A headline dated after ``day`` is ignored.
+    """
+    if freshness_days < 1:
+        raise ValueError("sentiment_freshness_days must be at least 1")
+    start = day - timedelta(days=freshness_days - 1)
+    chosen = [(obs_day, score) for obs_day, score in observations.items() if start <= obs_day <= day]
+    if not chosen:
+        return 0.0, False
+    ago = np.array([(day - obs_day).days for obs_day, _ in chosen], dtype=float)
+    weights = np.exp(-decay * ago)
+    weights = weights / weights.sum()
+    scores = np.array([score for _, score in chosen], dtype=float)
+    return float(np.dot(scores, weights)), True
+
+
+def sentiment_by_date(sentiment_df) -> Dict:
+    """Map each sentiment row to its UTC calendar date."""
+    out = {}
+    if sentiment_df is None or getattr(sentiment_df, "empty", True):
+        return out
+    for ts, row in sentiment_df.iterrows():
+        out[_as_calendar_date(ts)] = float(row["Compound_Score"])
+    return out
+
+
+def daily_sentiment_frame(trading_days, observations, freshness_days):
+    """One row per session: the fresh compound, or 0.0 when nothing is in window."""
+    index = []
+    compounds = []
+    covered = {}
+    for ts in trading_days:
+        day = _as_calendar_date(ts)
+        compound, is_covered = fresh_sentiment(observations, day, freshness_days)
+        index.append(ts)
+        compounds.append(compound)
+        covered[day] = (compound, is_covered)
+    frame = pd.DataFrame({"Compound_Score": compounds}, index=pd.DatetimeIndex(index))
+    return frame, covered
+
+
+def sentiment_coverage(trading_days, observation_dates, freshness_days: int = 5) -> Dict:
+    """Share of sessions with at least one sentiment row inside the freshness window.
+
+    A day is not covered just because some older article exists. The row has
+    to fall on a UTC date in ``[day - freshness_days + 1, day]``.
+    """
+    days = list(trading_days)
+    freshness_days = int(freshness_days)
+    if not days:
+        return {
+            "sentiment_coverage_pct": 0.0,
+            "sentiment_covered_days": 0,
+            "neutral_fallback_days": 0,
+            "sentiment_observation_days": 0,
+            "sentiment_freshness_days": freshness_days,
+        }
+    observations = sorted({_as_calendar_date(d) for d in observation_dates})
+    covered = 0
+    for day in days:
+        key = _as_calendar_date(day)
+        start = key - timedelta(days=freshness_days - 1)
+        lo = bisect.bisect_left(observations, start)
+        hi = bisect.bisect_right(observations, key)
+        if hi > lo:
+            covered += 1
+    return {
+        "sentiment_coverage_pct": 100.0 * covered / len(days),
+        "sentiment_covered_days": covered,
+        "neutral_fallback_days": len(days) - covered,
+        "sentiment_observation_days": len(observations),
+        "sentiment_freshness_days": freshness_days,
+    }
+
 
 class AlpacaBacktester:
     """
     Backtesting system that simulates trading strategies using historical Alpaca data
     """
     
-    def __init__(self, ticker: str, strategy: str = "momentum", initial_cash: float = 10000.0):
+    def __init__(self, ticker: str, strategy: str = "momentum", initial_cash: float = 10000.0,
+                 news_lookback_days: Optional[int] = None,
+                 commission_bps: float = 5.0, slippage_bps: float = 5.0,
+                 benchmark: Optional[str] = None,
+                 sentiment_freshness_days: int = 5):
         """
         Initialize the backtester
         
@@ -61,6 +209,17 @@ class AlpacaBacktester:
         self.ticker = ticker.upper()
         self.strategy = strategy.lower()
         self.initial_cash = initial_cash
+        # None requests news for the whole simulation. An int caps the window.
+        self.news_lookback_days = news_lookback_days
+        # Per-side costs. 5 bps of commission and 5 bps of slippage by default.
+        if commission_bps < 0 or slippage_bps < 0:
+            raise ValueError("Commission and slippage must be non-negative")
+        self.commission_bps = float(commission_bps)
+        self.slippage_bps = float(slippage_bps)
+        self.benchmark = benchmark.upper() if benchmark else None
+        if int(sentiment_freshness_days) < 1:
+            raise ValueError("sentiment_freshness_days must be at least 1")
+        self.sentiment_freshness_days = int(sentiment_freshness_days)
         
         # Portfolio tracking
         self.cash = initial_cash
@@ -87,19 +246,24 @@ class AlpacaBacktester:
         # Data storage
         self.full_price_data = None
         self.full_news_data = None
-        
-        # Initialize Alpaca client
-        try:
-            self.alpaca_client = StockHistoricalDataClient(
-                api_key=config.API_KEY,
-                secret_key=config.API_SECRET
+        self.benchmark_prices = None
+
+        # Alpaca client is created on the first live request so constructing a
+        # backtester with injected prices does not require real API keys.
+        self._alpaca_client = None
+
+    @property
+    def alpaca_client(self):
+        if self._alpaca_client is None:
+            api_key, api_secret = config.require_api_keys()
+            self._alpaca_client = StockHistoricalDataClient(
+                api_key=api_key,
+                secret_key=api_secret
             )
             print("Alpaca client initialized successfully")
-        except Exception as e:
-            print(f"Error initializing Alpaca client: {e}")
-            raise
+        return self._alpaca_client
     
-    def fetch_historical_data(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    def fetch_historical_data(self, start_date: datetime, end_date: datetime, symbol: str = None) -> pd.DataFrame:
         """
         Fetch historical daily bars from Alpaca
         
@@ -111,11 +275,12 @@ class AlpacaBacktester:
             DataFrame with OHLCV data
         """
         try:
-            print(f"Fetching historical data for {self.ticker} from {start_date.date()} to {end_date.date()}...")
+            symbol = (symbol or self.ticker).upper()
+            print(f"Fetching historical data for {symbol} from {start_date.date()} to {end_date.date()}...")
             
             # Create request for daily bars
             request_params = StockBarsRequest(
-                symbol_or_symbols=[self.ticker],
+                symbol_or_symbols=[symbol],
                 timeframe=TimeFrame.Day,
                 start=start_date,
                 end=end_date
@@ -153,7 +318,7 @@ class AlpacaBacktester:
                 print(f"Fetched {len(price_data)} days of price data")
                 return price_data
             else:
-                print(f"No price data found for {self.ticker}")
+                print(f"No price data found for {symbol}")
                 return pd.DataFrame()
                 
         except Exception as e:
@@ -176,8 +341,10 @@ class AlpacaBacktester:
             if end_date:
                 print(f"   Historical news ending at: {end_date.date()}")
             
-            # Use the existing scraper to get news data with historical support
-            profile_data, news_data = scraper.scrape_hybrid(self.ticker, days=days, end_date=end_date)
+            # Alpaca/Benzinga only. GNews does not honor a historical end date.
+            profile_data, news_data = scraper.scrape_historical_news(
+                self.ticker, days=days, end_date=end_date
+            )
             
             print(f"Fetched {len(news_data)} news articles")
             return news_data
@@ -201,12 +368,17 @@ class AlpacaBacktester:
         if end_date.tzinfo is None:
             end_date = pytz.utc.localize(end_date)
             
-        # Fetch price data with some buffer before start_date for technical indicators
-        price_start = start_date - timedelta(days=200)  # Buffer for 200-day SMA
-        self.full_price_data = self.fetch_historical_data(price_start, end_date)
+        # Fetch price data with some buffer before start_date for technical indicators.
+        # Injected frames are kept so offline runs do not open a client.
+        if self.full_price_data is None or self.full_price_data.empty:
+            # 200 trading bars for the 200-day SMA need about 290 calendar days.
+            price_start = start_date - timedelta(days=PRICE_WARMUP_CALENDAR_DAYS)
+            self.full_price_data = self.fetch_historical_data(price_start, end_date)
         
-        # Fetch news data with historical end date
-        self.full_news_data = self.fetch_news_data(days=news_days, end_date=end_date)
+        # Fetch news data with historical end date. An empty list is a real
+        # result (no articles) and is not replaced by a live call.
+        if self.full_news_data is None:
+            self.full_news_data = self.fetch_news_data(days=news_days, end_date=end_date)
         
         if self.full_price_data.empty:
             raise ValueError(f"No price data available for {self.ticker}")
@@ -242,7 +414,7 @@ class AlpacaBacktester:
             if isinstance(news_date, str):
                 try:
                     news_date = datetime.fromisoformat(news_date.replace('Z', '+00:00'))
-                except:
+                except ValueError:
                     continue
             elif not isinstance(news_date, datetime):
                 continue
@@ -275,12 +447,20 @@ class AlpacaBacktester:
                 print(f"Warning: Invalid price {price} for BUY order, skipping...")
                 return
                 
-            shares_to_buy = int(self.cash / price)
+            shares_to_buy = affordable_shares(
+                self.cash, price, self.commission_bps, self.slippage_bps
+            )
             if shares_to_buy > 0:
-                cost = shares_to_buy * price
+                fill_price, notional, commission, cost = buy_fill(
+                    price, shares_to_buy, self.commission_bps, self.slippage_bps
+                )
                 self.cash -= cost
                 self.shares += shares_to_buy
-                self.entry_price = price  # Track entry price for risk management
+                self.entry_price = fill_price  # Track entry price for risk management
+                # The trailing stop measures from this position's peak, not the
+                # account's all-time high. Without this reset, a book already 7%
+                # below its old peak stopped out every new entry the next day.
+                self.max_portfolio_value = self.cash + self.shares * price
                 
                 # Track first buy for fair buy-and-hold comparison
                 if self.first_buy_date is None:
@@ -292,6 +472,9 @@ class AlpacaBacktester:
                     'Action': 'BUY',
                     'Shares': shares_to_buy,
                     'Price': price,
+                    'Fill_Price': fill_price,
+                    'Commission': commission,
+                    'Notional': notional,
                     'Cost': cost,
                     'Buy_Score': buy_score,
                     'Cash_After': self.cash,
@@ -302,13 +485,16 @@ class AlpacaBacktester:
         
         elif action == "SELL" and self.shares > 0:
             # Sell all shares
-            proceeds = self.shares * price
+            sold_shares = self.shares
+            fill_price, notional, commission, proceeds = sell_fill(
+                price, sold_shares, self.commission_bps, self.slippage_bps
+            )
             self.cash += proceeds
             
             # Calculate P&L for this trade
             if self.entry_price and self.entry_price > 0:
-                pnl_pct = ((price - self.entry_price) / self.entry_price) * 100
-                pnl_dollar = (price - self.entry_price) * self.shares
+                pnl_pct = ((fill_price - self.entry_price) / self.entry_price) * 100
+                pnl_dollar = (fill_price - self.entry_price) * sold_shares - commission
             else:
                 pnl_pct = 0
                 pnl_dollar = 0
@@ -316,8 +502,11 @@ class AlpacaBacktester:
             self.trade_log.append({
                 'Date': date,
                 'Action': 'SELL',
-                'Shares': self.shares,
+                'Shares': sold_shares,
                 'Price': price,
+                'Fill_Price': fill_price,
+                'Commission': commission,
+                'Notional': notional,
                 'Proceeds': proceeds,
                 'Buy_Score': buy_score,
                 'Cash_After': self.cash,
@@ -365,7 +554,10 @@ class AlpacaBacktester:
         """
         Calculate adaptive buy/sell thresholds using shared logic with strategy-specific optimizations and bull market duration
         """
-        return calculate_adaptive_thresholds(score_history, market_regime, lookback, strategy=self.strategy, bull_market_duration=self.current_bull_duration)
+        return calculate_adaptive_thresholds(
+            score_history, market_regime, lookback, strategy=self.strategy,
+            bull_market_duration=self.current_bull_duration, ticker=self.ticker,
+        )
     
     def check_adaptive_risk_management(self, current_price: float, portfolio_value: float, market_regime: str, current_date: datetime = None) -> Tuple[bool, str]:
         """
@@ -418,19 +610,6 @@ class AlpacaBacktester:
         
         return False, ""
     
-    def check_buy_and_hold_mode(self, market_regime: str) -> bool:
-        """
-        Check if we should enter buy-and-hold mode for sustained bull markets
-        
-        Args:
-            market_regime: Current market regime
-            
-        Returns:
-            True if in buy-and-hold mode
-        """
-        risk_params = self.get_adaptive_risk_params(market_regime, current_date=None)  # Safe default if no date passed
-        return risk_params.get('buy_and_hold_mode', False)
-    
     def check_overtrading_protection(self, current_date: datetime, market_regime: str) -> bool:
         """
         Check if overtrading protection should prevent a trade
@@ -478,11 +657,6 @@ class AlpacaBacktester:
             print(f"OVERTRADING PROTECTION: Blocking BUY signal (Score: {buy_score:.1f}) - too many recent trades")
             return
         
-        # Check buy-and-hold mode
-        if action == "SELL" and self.check_buy_and_hold_mode(market_regime):
-            print(f"🔒 BUY-AND-HOLD MODE: Blocking SELL signal (Score: {buy_score:.1f}) - sustained bull market detected")
-            return
-        
         if action == "BUY" and self.cash > 0:
             # Get adaptive position sizing with conviction scoring
             risk_params = self.get_adaptive_risk_params(market_regime, date)
@@ -499,28 +673,39 @@ class AlpacaBacktester:
             # Apply conviction to position sizing
             final_position_multiplier = base_position_multiplier * conviction_score
             
-            # Calculate adaptive position size with conviction
-            base_shares = int(self.cash / price)
+            # Size off the all-in cost so commission and slippage fit in cash.
+            base_shares = affordable_shares(
+                self.cash, price, self.commission_bps, self.slippage_bps
+            )
             adjusted_shares = int(base_shares * final_position_multiplier)
             shares_to_buy = min(adjusted_shares, base_shares)  # Don't exceed available cash
             
             if shares_to_buy > 0:
-                cost = shares_to_buy * price
+                fill_price, notional, commission, cost = buy_fill(
+                    price, shares_to_buy, self.commission_bps, self.slippage_bps
+                )
                 self.cash -= cost
                 self.shares += shares_to_buy
-                self.entry_price = price  # Track entry price for risk management
+                self.entry_price = fill_price  # Economic entry, including slippage
+                # The trailing stop measures from this position's peak, not the
+                # account's all-time high. Without this reset, a book already 7%
+                # below its old peak stopped out every new entry the next day.
+                self.max_portfolio_value = self.cash + self.shares * price
                 self.last_buy_date = date  # Track buy date for minimum holding period
                 
                 # Track first buy for fair buy-and-hold comparison
                 if self.first_buy_date is None:
                     self.first_buy_date = date
-                    self.first_buy_price = price
+                    self.first_buy_price = fill_price
                 
                 self.trade_log.append({
                     'Date': date,
                     'Action': 'BUY',
                     'Shares': shares_to_buy,
                     'Price': price,
+                    'Fill_Price': fill_price,
+                    'Commission': commission,
+                    'Notional': notional,
                     'Cost': cost,
                     'Buy_Score': buy_score,
                     'Market_Regime': market_regime,
@@ -539,13 +724,16 @@ class AlpacaBacktester:
         
         elif action == "SELL" and self.shares > 0:
             # Sell all shares
-            proceeds = self.shares * price
+            sold_shares = self.shares
+            fill_price, notional, commission, proceeds = sell_fill(
+                price, sold_shares, self.commission_bps, self.slippage_bps
+            )
             self.cash += proceeds
             
-            # Calculate P&L for this trade
+            # Calculate P&L for this trade against the cost-adjusted entry
             if self.entry_price and self.entry_price > 0:
-                pnl_pct = ((price - self.entry_price) / self.entry_price) * 100
-                pnl_dollar = (price - self.entry_price) * self.shares
+                pnl_pct = ((fill_price - self.entry_price) / self.entry_price) * 100
+                pnl_dollar = (fill_price - self.entry_price) * sold_shares - commission
             else:
                 pnl_pct = 0
                 pnl_dollar = 0
@@ -553,8 +741,11 @@ class AlpacaBacktester:
             self.trade_log.append({
                 'Date': date,
                 'Action': 'SELL',
-                'Shares': self.shares,
+                'Shares': sold_shares,
                 'Price': price,
+                'Fill_Price': fill_price,
+                'Commission': commission,
+                'Notional': notional,
                 'Proceeds': proceeds,
                 'Buy_Score': buy_score,
                 'Market_Regime': market_regime,
@@ -572,7 +763,8 @@ class AlpacaBacktester:
             self.shares = 0
             self.entry_price = None  # Reset entry price
     
-    def run(self, start_date: datetime, end_date: datetime, lookback_days: int = 30) -> Dict:
+    def run(self, start_date: datetime, end_date: datetime, lookback_days: int = 30,
+            split_date: datetime = None) -> Dict:
         """
         Run the backtesting simulation with fully optimized pre-calculated scores and momentum reversal detection
         
@@ -601,11 +793,13 @@ class AlpacaBacktester:
         else:
             end_date = end_date.astimezone(pytz.utc)
         
-        # OPTIMIZATION: Limit news data to simulation period + small buffer
-        # Fetching 90+ days of news for short backtests is wasteful
+        # News covers the whole simulation unless the caller set a cap.
+        # The previous hard 90-day cap left every earlier session on a
+        # neutral 5.0 because no article had been requested for it.
         simulation_days = (end_date - start_date).days
-        news_days = min(90, max(30, simulation_days + 10))  # Cap at 90 days, min 30 days
+        news_days = news_window_days(simulation_days, self.news_lookback_days)
         self.prepare_simulation_data(start_date, end_date, news_days)
+        self._news_days_requested = news_days
         
         # Get trading days from price data
         trading_days = self.full_price_data[
@@ -624,11 +818,15 @@ class AlpacaBacktester:
         
         print(f"Simulating {len(trading_days)} trading days...")
         
-        # OPTIMIZATION: Skip sentiment analysis for very short periods (< 7 days)
-        # Use neutral scores to avoid expensive NLP processing
-        if simulation_days < 7 or len(self.full_news_data) == 0:
+        observation_dates = []
+        sentiment_for_day = {}
+        # Windows under 7 days skip NLP and use a neutral score. That is reported
+        # as zero sentiment coverage. Longer windows score every session.
+        if simulation_days < 7:
             print(f"⚡ Fast mode: Using neutral scores for {simulation_days}-day period (no sentiment analysis)")
             score_lookup = {date.date() if hasattr(date, 'date') else date: 5.0 for date in trading_days}
+            for date in trading_days:
+                sentiment_for_day[_as_calendar_date(date)] = (0.0, False)
         else:
             # OPTIMIZATION: Analyze ALL news articles ONCE and calculate ALL scores ONCE
             print(f"🧠 Analyzing {len(self.full_news_data)} news articles (one-time processing)...")
@@ -640,39 +838,38 @@ class AlpacaBacktester:
                 print(f"Error in sentiment analysis: {e}")
                 full_sentiment_df = pd.DataFrame()
             
-            if full_sentiment_df.empty:
-                print("No sentiment data available, using neutral scores")
-                # Create a simple lookup with neutral scores for all trading days
-                score_lookup = {date.date() if hasattr(date, 'date') else date: 5.0 for date in trading_days}
-            else:
-                # PRE-CALCULATE ALL Final_Buy_Scores using the complete dataset
-                print(f"🔢 Pre-calculating all Final_Buy_Scores for entire period...")
-                
-                # Calculate verdict using the FULL sentiment and price data
-                verdict = market.calculate_verdict(
-                    ticker=self.ticker,
-                    sentiment_df=full_sentiment_df,
-                    strategy=self.strategy,
-                    lookback_days=simulation_days + 210,
-                    custom_date=None,  # Use end date as reference
-                    price_data=self.full_price_data  # Use full price data
+            observations = sentiment_by_date(full_sentiment_df)
+            observation_dates = list(observations.keys())
+            # One compound per session. Headlines older than the freshness
+            # window become neutral instead of being carried forward.
+            daily_sentiment, sentiment_for_day = daily_sentiment_frame(
+                trading_days, observations, self.sentiment_freshness_days
+            )
+            print(f"🔢 Pre-calculating Final_Buy_Scores for {len(trading_days)} sessions...")
+            verdict = market.calculate_verdict(
+                ticker=self.ticker,
+                sentiment_df=daily_sentiment,
+                strategy=self.strategy,
+                lookback_days=simulation_days + 210,
+                # Anchor the price window to the backtest end. None uses
+                # datetime.now(), so the same history would score differently
+                # on a later day.
+                custom_date=end_date,
+                price_data=self.full_price_data
+            )
+            score_lookup = {}
+            for timestamp, score in verdict.get('Final_Buy_Scores_Over_Time', []):
+                date_key = timestamp.date() if hasattr(timestamp, 'date') else timestamp
+                score_lookup[date_key] = score
+            missing = [
+                _as_calendar_date(day) for day in trading_days
+                if _as_calendar_date(day) not in score_lookup
+            ]
+            if missing:
+                raise KeyError(
+                    f"No Final_Buy_Score for {missing[0]}; refusing to reuse an older score"
                 )
-                
-                # Extract all Final_Buy_Scores and create a lookup dictionary
-                final_buy_scores_over_time = verdict.get('Final_Buy_Scores_Over_Time', [])
-                score_lookup = {}
-                
-                for timestamp, score in final_buy_scores_over_time:
-                    # Create lookup by date for fast access
-                    if hasattr(timestamp, 'date'):
-                        date_key = timestamp.date()
-                    else:
-                        date_key = timestamp
-                    score_lookup[date_key] = score
-                
-                print(f"Pre-calculated {len(score_lookup)} Final_Buy_Scores")
-                
-                print(f"Pre-calculated {len(score_lookup)} Final_Buy_Scores")
+            print(f"Pre-calculated {len(score_lookup)} Final_Buy_Scores")
         
         print()
         
@@ -684,10 +881,6 @@ class AlpacaBacktester:
         risk_params = self.get_adaptive_risk_params(initial_market_regime, current_date=start_date)
         print(f"Initial Adaptive Parameters: Stop-loss: {risk_params['stop_loss_pct']*100:.0f}%, Take-profit: {risk_params['take_profit_pct']*100:.0f}%, Position size: {risk_params['position_size_multiplier']:.1f}x")
         print()
-        
-        # OPTIMIZATION: Reduce regime update frequency for longer backtests
-        # Update every 5 days for short tests, every 10 days for long tests
-        regime_update_interval = 10 if simulation_days > 180 else 5
         
         # Simulation loop - now extremely fast since everything is pre-calculated
         score_history = []  # Track scores for dynamic thresholds and momentum reversal detection
@@ -703,6 +896,16 @@ class AlpacaBacktester:
         pending_sell_score = 0
         pending_sell_regime = None
         pending_sell_reason = ""
+
+        split_ts = _as_utc_datetime(split_date) if split_date is not None else None
+        if split_ts is not None:
+            held_out_days = [day for day in trading_days if day >= split_ts]
+            if len(held_out_days) < 2:
+                print("Warning: split date does not leave two held-out sessions; reporting the full window")
+                split_ts = None
+        frozen_thresholds = None
+        test_started = False
+        train_trade_log = []
         
         for i, simulation_date in enumerate(trading_days):
             try:
@@ -717,6 +920,35 @@ class AlpacaBacktester:
                 if current_close <= 0 or current_open <= 0:
                     print(f"Warning: Invalid price for {simulation_date.date()}, skipping...")
                     continue
+
+                # Freeze the adaptive threshold adjustment from the dates before
+                # split_date, then reset the book. This does not retune the
+                # hand-set base thresholds or the regime and risk parameters.
+                if split_ts is not None and not test_started and simulation_date >= split_ts:
+                    frozen_thresholds = self.calculate_adaptive_thresholds(
+                        score_history, current_market_regime
+                    )
+                    train_trade_log = list(self.trade_log)
+                    self.trade_log = []
+                    self.portfolio_history = []
+                    self.cash = self.initial_cash
+                    self.shares = 0
+                    self.entry_price = None
+                    self.last_buy_date = None
+                    self.first_buy_date = None
+                    self.first_buy_price = None
+                    self.max_portfolio_value = self.initial_cash
+                    self.recent_trades = []
+                    self.last_trade_date = None
+                    pending_buy_shares = 0
+                    pending_sell = False
+                    pending_sell_reason = ""
+                    test_started = True
+                    print(
+                        f"Held-out period starts {simulation_date.date()} "
+                        f"with frozen thresholds buy>={frozen_thresholds[0]:.3f} "
+                        f"sell<={frozen_thresholds[1]:.3f}"
+                    )
                 
                 # OPTIMIZATION V9: EXECUTION LOOKAHEAD BIAS FIX
                 # Execute any pending trades from the PREVIOUS day at TODAY'S Open price.
@@ -744,20 +976,15 @@ class AlpacaBacktester:
                     pending_sell_reason = ""
                 
                 
-                # FAST LOOKUP: Get pre-calculated Final_Buy_Score for this date
+                # Every session has its own score. Reusing the previous day would
+                # freeze that day's technicals as well as its sentiment.
                 sim_date_key = simulation_date.date() if hasattr(simulation_date, 'date') else simulation_date
-                
-                # Look for exact match first
-                if sim_date_key in score_lookup:
-                    buy_score_t = score_lookup[sim_date_key]
-                else:
-                    # Find the most recent score on or before this date
-                    valid_dates = [d for d in score_lookup.keys() if d <= sim_date_key]
-                    if valid_dates:
-                        most_recent_date = max(valid_dates)
-                        buy_score_t = score_lookup[most_recent_date]
-                    else:
-                        buy_score_t = 5.0  # Neutral fallback
+                if sim_date_key not in score_lookup:
+                    raise KeyError(
+                        f"No Final_Buy_Score for {sim_date_key}; refusing to reuse an older score"
+                    )
+                buy_score_t = score_lookup[sim_date_key]
+                sentiment_compound, sentiment_covered = sentiment_for_day.get(sim_date_key, (0.0, False))
                 
                 # Add to score history for dynamic thresholds and momentum reversal detection
                 score_history.append(buy_score_t)
@@ -768,7 +995,7 @@ class AlpacaBacktester:
                 
                 # OPTIMIZATION: Reduce momentum reversal detection frequency
                 # Check for regime changes at configurable intervals (not every 5 days)
-                if i > 0 and i % regime_update_interval == 0 and len(score_history) >= 10:
+                if i > 0 and i % REGIME_UPDATE_INTERVAL == 0 and len(score_history) >= 10:
                     # Get recent price data for reversal detection
                     try:
                         recent_price_data = self.full_price_data.loc[:simulation_date].tail(10)
@@ -830,7 +1057,7 @@ class AlpacaBacktester:
                     self.current_bull_duration = 0
                 
                 # OPTIMIZATION: Continually re-evaluate regime without future data
-                if i > 0 and i % regime_update_interval == 0:
+                if i > 0 and i % REGIME_UPDATE_INTERVAL == 0:
                     current_market_regime = self.detect_market_regime(self.full_price_data, simulation_date)
                 
                 # ADAPTIVE RISK MANAGEMENT: Check regime-specific stop-loss/take-profit first
@@ -844,8 +1071,11 @@ class AlpacaBacktester:
                     pending_sell_reason = risk_reason
                     print(f"Pending {risk_reason} for T+1 Open")
                 else:
-                    # ADAPTIVE THRESHOLDS: Calculate regime-aware buy/sell thresholds
-                    buy_threshold, sell_threshold = self.calculate_adaptive_thresholds(score_history, current_market_regime)
+                    # Thresholds are frozen from the training window once a split is active.
+                    if frozen_thresholds is not None:
+                        buy_threshold, sell_threshold = frozen_thresholds
+                    else:
+                        buy_threshold, sell_threshold = self.calculate_adaptive_thresholds(score_history, current_market_regime)
                     
                     # Debug: Print adaptive thresholds for first few days
                     if i < 3:
@@ -883,6 +1113,8 @@ class AlpacaBacktester:
                     'Shares': self.shares,
                     'Portfolio_Value': portfolio_value,
                     'Final_Buy_Score': buy_score_t,  # Use pre-calculated Final_Buy_Score
+                    'Sentiment_Compound': sentiment_compound,
+                    'Sentiment_Covered': sentiment_covered,
                     'Market_Regime': current_market_regime  # Track dynamic regime changes
                 })
                 
@@ -897,46 +1129,72 @@ class AlpacaBacktester:
                 print(f"Error on {simulation_date.date()}: {e}")
                 continue
         
-        # Final portfolio value
-        final_price = self.portfolio_history[-1]['Price'] if self.portfolio_history else 0
-        final_portfolio_value = self.cash + (self.shares * final_price)
+        # Final portfolio value is the last close mark, after any fill at that open.
+        final_portfolio_value = (
+            self.portfolio_history[-1]['Portfolio_Value'] if self.portfolio_history else self.cash
+        )
+        eval_days = [day for day in trading_days if split_ts is None or day >= split_ts] if test_started else list(trading_days)
+        stats = performance_metrics(self.portfolio_history, self.initial_cash, len(self.trade_log))
+        total_return = stats['total_return_pct']
+
+        # Buy-and-hold enters at the next open, the first price the strategy can fill.
+        # After a train/test split this is the held-out window only.
+        hold = buy_and_hold_result(
+            self.full_price_data,
+            eval_days,
+            self.initial_cash,
+            self.commission_bps,
+            self.slippage_bps,
+        )
+        buy_hold_return = hold['return_pct']
+        if hold['entry_date'] is not None:
+            print(
+                f"Buy-and-Hold: entered at next open on {hold['entry_date'].date()} "
+                f"at ${hold['quoted_entry']:.2f}"
+            )
+
+        benchmark_return = None
+        if self.benchmark:
+            bench_prices = self.benchmark_prices
+            if bench_prices is None:
+                bench_prices = self.fetch_historical_data(
+                    start_date - timedelta(days=5), end_date, symbol=self.benchmark
+                )
+            bench = buy_and_hold_result(
+                bench_prices,
+                eval_days,
+                self.initial_cash,
+                self.commission_bps,
+                self.slippage_bps,
+            )
+            benchmark_return = bench['return_pct']
+            print(f"{self.benchmark} benchmark return: {benchmark_return:+.2f}%")
         
-        # Calculate performance metrics
-        if self.initial_cash > 0:
-            total_return = ((final_portfolio_value - self.initial_cash) / self.initial_cash) * 100
-        else:
-            total_return = 0
-        
-        # Buy-and-Hold Comparison: Always start on Day 1 for fair comparison
-        # Since our algorithm CAN buy on Day 1, buy-and-hold should always start on Day 1
-        if len(trading_days) > 0:
-            try:
-                initial_price = self.full_price_data.loc[trading_days[0], 'Close']
-                if initial_price > 0 and self.initial_cash > 0:
-                    buy_hold_shares = self.initial_cash / initial_price
-                    buy_hold_value = buy_hold_shares * final_price
-                    buy_hold_return = ((buy_hold_value - self.initial_cash) / self.initial_cash) * 100
-                    
-                    print(f"Buy-and-Hold: Started on {trading_days[0].date()} at ${initial_price:.2f} (Day 1 - fair comparison)")
-                else:
-                    buy_hold_return = 0
-            except (KeyError, IndexError):
-                print("Warning: Could not calculate buy-and-hold return due to missing price data")
-                buy_hold_return = 0
-        else:
-            buy_hold_return = 0
-        
-        # Calculate dollar-based alpha for more accurate representation
-        # This shows the actual dollar difference in gains
-        buy_hold_final_value = self.initial_cash * (1 + buy_hold_return / 100)
+        buy_hold_final_value = hold['final_value']
         strategy_gain = final_portfolio_value - self.initial_cash
         buy_hold_gain = buy_hold_final_value - self.initial_cash
         dollar_alpha = strategy_gain - buy_hold_gain
         
-        # Calculate percentage-based alpha (relative to initial capital)
-        # This shows how much better/worse the strategy performed as a % of initial investment
         pct_point_alpha = total_return - buy_hold_return
-        relative_alpha = (dollar_alpha / self.initial_cash) * 100
+        relative_alpha = (dollar_alpha / self.initial_cash) * 100 if self.initial_cash else 0.0
+        coverage = sentiment_coverage(
+            eval_days, observation_dates, self.sentiment_freshness_days
+        )
+        eval_start_day = _as_calendar_date(eval_days[0]) if eval_days else _as_calendar_date(start_date)
+        params_tuned_on_eval_window = eval_start_day <= PARAMS_LAST_CHANGED
+        if params_tuned_on_eval_window:
+            # filterwarnings("ignore") swallows warnings.warn, so print as well.
+            warnings.warn(
+                "Evaluation window starts on or before PARAMS_LAST_CHANGED "
+                f"({PARAMS_LAST_CHANGED.isoformat()}, commit e805e3f). "
+                "Hand-tuned parameters are not held out of this window.",
+                stacklevel=2,
+            )
+            print(
+                "NOTICE: evaluation starts on or before "
+                f"{PARAMS_LAST_CHANGED.isoformat()} (commit e805e3f). "
+                "Hand-tuned parameters overlap this window and are not held out."
+            )
         
         results = {
             'ticker': self.ticker,
@@ -948,7 +1206,15 @@ class AlpacaBacktester:
             'final_cash': self.cash,
             'final_shares': self.shares,
             'total_return_pct': total_return,
+            'cagr_pct': stats['cagr_pct'],
+            'sharpe': stats['sharpe'],
+            'max_drawdown_pct': stats['max_drawdown_pct'],
             'buy_hold_return_pct': buy_hold_return,
+            'buy_hold_entry_date': hold['entry_date'],
+            'percent_alpha': pct_point_alpha,
+            'benchmark_ticker': self.benchmark,
+            'benchmark_return_pct': benchmark_return,
+            'benchmark_alpha': None if benchmark_return is None else total_return - benchmark_return,
             'alpha': pct_point_alpha,  # Keep for backward compatibility
             'dollar_alpha': dollar_alpha,  # New: actual dollar difference
             'relative_alpha': relative_alpha,  # New: alpha as % of initial capital
@@ -959,7 +1225,21 @@ class AlpacaBacktester:
             'trade_log': self.trade_log,
             'initial_regime': initial_market_regime,
             'final_regime': current_market_regime,
-            'regime_updates': regime_update_counter
+            'regime_updates': regime_update_counter,
+            'news_source': 'alpaca',
+            'news_days_requested': getattr(self, '_news_days_requested', None),
+            'commission_bps': self.commission_bps,
+            'slippage_bps': self.slippage_bps,
+            'split_date': split_ts,
+            'split_applied': test_started,
+            'eval_start': eval_days[0] if eval_days else start_date,
+            'eval_end': eval_days[-1] if eval_days else end_date,
+            'frozen_buy_threshold': None if frozen_thresholds is None else frozen_thresholds[0],
+            'frozen_sell_threshold': None if frozen_thresholds is None else frozen_thresholds[1],
+            'train_num_trades': len(train_trade_log),
+            'train_trade_log': train_trade_log,
+            'params_tuned_on_eval_window': params_tuned_on_eval_window,
+            **coverage,
         }
         
         self.print_results(results)
@@ -973,14 +1253,33 @@ class AlpacaBacktester:
         print(f"Ticker: {results['ticker']}")
         print(f"Strategy: {results['strategy'].upper()}")
         print(f"Period: {results['start_date'].date()} to {results['end_date'].date()}")
+        if results.get('split_applied'):
+            print(
+                f"Held-out evaluation: {results['eval_start'].date()} to {results['eval_end'].date()} "
+                f"(thresholds frozen at {results['frozen_buy_threshold']:.3f}/"
+                f"{results['frozen_sell_threshold']:.3f}; "
+                f"{results.get('train_num_trades', 0)} training trades excluded)"
+            )
         print(f"Initial Cash: ${results['initial_cash']:,.2f}")
         print(f"Final Portfolio Value: ${results['final_portfolio_value']:,.2f}")
         print(f"Final Cash: ${results['final_cash']:,.2f}")
         print(f"Final Shares: {results['final_shares']}")
         print()
         print(f"Strategy Return: {results['total_return_pct']:+.2f}%")
+        cagr = results.get('cagr_pct')
+        sharpe = results.get('sharpe')
+        print(f"CAGR: {'n/a' if cagr is None else f'{cagr:+.2f}%'}")
+        print(f"Sharpe: {'n/a' if sharpe is None else f'{sharpe:.2f}'}")
+        print(f"Max Drawdown: {results.get('max_drawdown_pct', 0):+.2f}%")
         print(f"Buy & Hold Return: {results['buy_hold_return_pct']:+.2f}%")
         print(f"Alpha (Percentage Points): {results['alpha']:+.2f}%")
+        if results.get('benchmark_ticker'):
+            bench_ret = results.get('benchmark_return_pct')
+            bench_alpha = results.get('benchmark_alpha')
+            bench_ret_s = "n/a" if bench_ret is None else f"{bench_ret:+.2f}%"
+            bench_alpha_s = "n/a" if bench_alpha is None else f"{bench_alpha:+.2f}%"
+            print(f"{results['benchmark_ticker']} Return: {bench_ret_s}")
+            print(f"Alpha vs {results['benchmark_ticker']}: {bench_alpha_s}")
         print()
         print(f"Dollar Performance:")
         print(f"   Strategy Gain: ${results['strategy_gain']:+,.2f}")
@@ -989,6 +1288,19 @@ class AlpacaBacktester:
         print(f"   Relative Alpha: {results['relative_alpha']:+.2f}% of initial capital")
         print()
         print(f"Number of Trades: {results['num_trades']}")
+        print(
+            f"Transaction Costs: {results.get('commission_bps', 0):.1f} bps commission "
+            f"+ {results.get('slippage_bps', 0):.1f} bps slippage, per side"
+        )
+        coverage_pct = results.get('sentiment_coverage_pct')
+        if coverage_pct is not None:
+            print(
+                f"Sentiment Coverage: {coverage_pct:.1f}% "
+                f"({results.get('sentiment_covered_days', 0)} covered, "
+                f"{results.get('neutral_fallback_days', 0)} neutral fallback, "
+                f"{results.get('sentiment_observation_days', 0)} observation days, "
+                f"source={results.get('news_source', 'alpaca')})"
+            )
         
         # Market regime information
         initial_regime = results.get('initial_regime', 'N/A')

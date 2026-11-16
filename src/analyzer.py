@@ -36,8 +36,15 @@ def _ensure_model():
             
             logging.info("Loading DistilRoBERTa financial sentiment model...")
             model_name = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
-            _ai_tokenizer = AutoTokenizer.from_pretrained(model_name)
-            _ai_model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            # Commit that contains model.safetensors for this repo. Pinning the
+            # revision stops a later upload from changing the weights we load.
+            model_revision = "ae0eab9ad336d7d548e0efe394b07c04bcaf6e91"
+            _ai_tokenizer = AutoTokenizer.from_pretrained(
+                model_name, revision=model_revision, use_safetensors=True
+            )
+            _ai_model = AutoModelForSequenceClassification.from_pretrained(
+                model_name, revision=model_revision, use_safetensors=True
+            )
             
             if torch.cuda.is_available():
                 device = torch.device("cuda")
@@ -289,7 +296,7 @@ def get_hybrid_sentiment_batch(texts, ticker="", batch_size=32):
                 try:
                     scores = vader_analyzer.polarity_scores(cleaned_text)
                     vader_scores.append(scores['compound'])
-                except:
+                except (AttributeError, TypeError, ValueError):
                     vader_scores.append(get_simple_sentiment(cleaned_text))
         else:
             vader_scores = [get_simple_sentiment(text) for text in texts]
@@ -593,6 +600,12 @@ def get_sentiment(parsed_data, ticker, timeframe_days=30):
                               for s in df['Source']], dtype=np.float32)
     df['Weight'] = source_weights
     df['Compound_Score'] = np.clip(df['Raw_Score'] * df['Weight'], -1.0, 1.0).astype('float32')
+
+    # The scraper returns newest-first. Sort before grouping so the aggregated
+    # index is chronological. groupby(sort=False) preserved newest-first order,
+    # and the rolling window in calculate_verdict then treated future days as
+    # already inside the window for earlier scores.
+    df = df.sort_values('Timestamp', ascending=True, kind='mergesort')
     
     # Time grouping
     if timeframe_days <= 1:
@@ -615,16 +628,16 @@ def get_sentiment(parsed_data, ticker, timeframe_days=30):
         return np.sum(scores * weights) / weight_sum if weight_sum > 0 else 0.0
     
     # Main aggregation
-    result_df = df.groupby('TimeGroup', sort=False).agg({
+    result_df = df.groupby('TimeGroup', sort=True).agg({
         'Raw_Score': 'mean', 
         'Weight': 'mean'
     }).astype(np.float32)
     
     # Calculate weighted compound scores
     try:
-        weighted_scores = df.groupby('TimeGroup', sort=False).apply(weighted_mean, include_groups=False)
+        weighted_scores = df.groupby('TimeGroup', sort=True).apply(weighted_mean, include_groups=False)
     except TypeError:
-        weighted_scores = df.groupby('TimeGroup', sort=False).apply(weighted_mean)
+        weighted_scores = df.groupby('TimeGroup', sort=True).apply(weighted_mean)
     
     result_df['Compound_Score'] = weighted_scores.astype(np.float32)
     
@@ -636,11 +649,11 @@ def get_sentiment(parsed_data, ticker, timeframe_days=30):
             count_col = f'{source_type.title()}_Count'
             
             try:
-                sentiment_scores = source_df.groupby('TimeGroup', sort=False).apply(weighted_mean, include_groups=False)
+                sentiment_scores = source_df.groupby('TimeGroup', sort=True).apply(weighted_mean, include_groups=False)
             except TypeError:
-                sentiment_scores = source_df.groupby('TimeGroup', sort=False).apply(weighted_mean)
+                sentiment_scores = source_df.groupby('TimeGroup', sort=True).apply(weighted_mean)
             
-            counts = source_df.groupby('TimeGroup', sort=False).size()
+            counts = source_df.groupby('TimeGroup', sort=True).size()
             
             result_df[sentiment_col] = sentiment_scores.reindex(result_df.index, fill_value=0).astype(np.float32)
             result_df[count_col] = counts.reindex(result_df.index, fill_value=0).astype(np.int16)

@@ -162,8 +162,23 @@ def main():
             pass
     
     # Parse flags
-    show_plot = '--plot' in remaining_args[cash_idx:] or '--no-plot' not in remaining_args[cash_idx:]  # Default to True unless --no-plot
-    save_results = '--save' in remaining_args[cash_idx:]
+    flag_args = remaining_args[cash_idx:]
+    show_plot = '--plot' in flag_args or '--no-plot' not in flag_args  # Default to True unless --no-plot
+    save_results = '--save' in flag_args
+    benchmark = None
+    split_date = None
+    if '--benchmark' in flag_args:
+        bench_idx = flag_args.index('--benchmark')
+        if bench_idx + 1 >= len(flag_args):
+            print("--benchmark requires a ticker, for example SPY")
+            return 1
+        benchmark = flag_args[bench_idx + 1]
+    if '--split-date' in flag_args:
+        split_idx = flag_args.index('--split-date')
+        if split_idx + 1 >= len(flag_args):
+            print("--split-date requires YYYY-MM-DD")
+            return 1
+        split_date = pytz.utc.localize(datetime.strptime(flag_args[split_idx + 1], "%Y-%m-%d"))
     
     # Display configuration
     period_days = (end_date - start_date).days
@@ -174,8 +189,8 @@ def main():
     
     try:
         # Run backtest
-        backtester = AlpacaBacktester(ticker, strategy, initial_cash)
-        results = backtester.run(start_date, end_date, lookback_days=30)
+        backtester = AlpacaBacktester(ticker, strategy, initial_cash, benchmark=benchmark)
+        results = backtester.run(start_date, end_date, lookback_days=30, split_date=split_date)
         
         # Show plot by default (unless --no-plot is specified)
         if show_plot:
