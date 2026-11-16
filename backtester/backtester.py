@@ -457,6 +457,10 @@ class AlpacaBacktester:
                 self.cash -= cost
                 self.shares += shares_to_buy
                 self.entry_price = fill_price  # Track entry price for risk management
+                # The trailing stop measures from this position's peak, not the
+                # account's all-time high. Without this reset, a book already 7%
+                # below its old peak stopped out every new entry the next day.
+                self.max_portfolio_value = self.cash + self.shares * price
                 
                 # Track first buy for fair buy-and-hold comparison
                 if self.first_buy_date is None:
@@ -683,6 +687,10 @@ class AlpacaBacktester:
                 self.cash -= cost
                 self.shares += shares_to_buy
                 self.entry_price = fill_price  # Economic entry, including slippage
+                # The trailing stop measures from this position's peak, not the
+                # account's all-time high. Without this reset, a book already 7%
+                # below its old peak stopped out every new entry the next day.
+                self.max_portfolio_value = self.cash + self.shares * price
                 self.last_buy_date = date  # Track buy date for minimum holding period
                 
                 # Track first buy for fair buy-and-hold comparison
