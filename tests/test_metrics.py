@@ -45,6 +45,20 @@ def test_buy_and_hold_needs_a_second_session():
     assert result["entry_price"] is None
 
 
+def test_first_day_move_is_included_in_returns():
+    # Two marks, neither of which is the starting cash. Without a leading
+    # initial-cash point there is only one return, so Sharpe stays unset.
+    history = [
+        {"Date": datetime(2021, 1, 5), "Portfolio_Value": 110.0},
+        {"Date": datetime(2021, 1, 6), "Portfolio_Value": 100.0},
+    ]
+    stats = performance_metrics(history, 100.0, num_trades=1)
+    assert stats["total_return_pct"] == pytest.approx(0.0)
+    # Opening move is +10%, then a give-back. Sharpe needs both, so the
+    # series has to start at the initial cash rather than at the first mark.
+    assert stats["sharpe"] is not None
+
+
 def test_performance_metrics_cover_return_cagr_sharpe_and_drawdown():
     history = [
         {"Date": datetime(2021, 1, 4), "Portfolio_Value": 100.0},

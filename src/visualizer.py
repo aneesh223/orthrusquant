@@ -121,7 +121,7 @@ def plot_graph(ticker, merged_df, company_info, timeframe_days=30, strategy_mode
                     dt = pytz.utc.localize(dt)
                 dt_et = dt.astimezone(et_tz)
                 return dt_et.strftime('%m/%d %H:%M ET')
-            except:
+            except Exception:
                 return mdates.DateFormatter('%m/%d %H:%M')(x, pos)
         
         ax2.xaxis.set_major_formatter(plt.FuncFormatter(format_time_et))

@@ -5,7 +5,7 @@ earlier day's score. Sentiment keys are bare ``datetime.date`` objects, which
 is the shape ``get_sentiment`` produces for multi-day frames.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -34,8 +34,17 @@ def _business_prices(n=260, start="2021-01-04", seed=0):
 def _scores_by_date(verdict):
     out = {}
     for ts, score in verdict["Final_Buy_Scores_Over_Time"]:
-        out[ts.date()] = float(score)
+        if hasattr(ts, "date") and not isinstance(ts, date):
+            key = ts.date()
+        else:
+            key = pd.Timestamp(ts).date()
+        out[key] = float(score)
     return out
+
+
+def test_scores_by_date_accepts_a_bare_date():
+    verdict = {"Final_Buy_Scores_Over_Time": [(date(2021, 1, 4), 5.5)]}
+    assert _scores_by_date(verdict) == {date(2021, 1, 4): 5.5}
 
 
 def _disable_transformer(monkeypatch):

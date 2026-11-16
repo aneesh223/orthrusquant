@@ -118,6 +118,9 @@ def performance_metrics(portfolio_history, initial_cash, num_trades):
     if not portfolio_history or initial_cash <= 0:
         return blank
     values = np.array([float(row["Portfolio_Value"]) for row in portfolio_history], dtype=float)
+    # The recorded marks start after the open. Put the starting cash in front
+    # so the first session's move is part of the return series.
+    values = np.concatenate([[float(initial_cash)], values])
     dates = [row["Date"] for row in portfolio_history]
     final = float(values[-1])
     total_return_pct = (final - initial_cash) / initial_cash * 100.0
