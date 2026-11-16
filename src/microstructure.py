@@ -3,7 +3,8 @@ Convolutional Order Book - experimental, untrained vision module.
 
 This module defines a small CNN over a 64x64 liquidity heatmap built from
 1-minute OHLCV bars. There is no training code in this repository. Weights
-would be loaded from ``models/orderbook_cnn.pt``, which is gitignored. When
+would be loaded from ``models/orderbook_cnn.pt`` next to the repository root
+(resolved from this file, not the process working directory), which is gitignored. When
 that file is absent, ``analyze_liquidity`` returns a neutral anomaly score of
 0.5 and does not detect liquidity voids or accumulation zones.
 """
@@ -18,7 +19,10 @@ from typing import Optional, Dict, Union
 logger = logging.getLogger(__name__)
 
 import os
-MODEL_PATH = "models/orderbook_cnn.pt"
+from pathlib import Path
+# Resolved from this file, not the process cwd, so a local models/ directory
+# cannot be swapped in by changing directories.
+MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "orderbook_cnn.pt"
 _model_trained = False
 
 
@@ -55,11 +59,15 @@ def _get_model():
         
         global _model_trained
         if os.path.exists(MODEL_PATH):
-            _model.load_state_dict(torch.load(MODEL_PATH, map_location=_device))
+            # weights_only refuses arbitrary pickle reducers (CVE-2025-32434 class).
+            _model.load_state_dict(
+                torch.load(MODEL_PATH, map_location=_device, weights_only=True)
+            )
             _model_trained = True
         else:
             logger.warning("model weights not found")
-            _model_trained = False
+            # Leave a True flag alone. Tests set it so inference can run
+            # without a weight file. The module default is False.
         
     return _model, _device
 
@@ -280,6 +288,9 @@ def analyze_liquidity(ticker: str) -> Dict[str, Union[float, str]]:
         - Insufficient data: "Insufficient data for microstructure analysis"
     """
     try:
+        # Load weights before reading the flag. _get_model is what sets it,
+        # so checking first made a real state_dict unreachable.
+        _get_model()
         if not _model_trained:
             return {'anomaly_score': 0.5, 'status': 'Model not trained', 'confidence': 'low'}
         # Import get_intraday_data from src.market
