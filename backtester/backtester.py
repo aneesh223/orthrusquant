@@ -64,6 +64,12 @@ warnings.filterwarnings("ignore")
 REGIME_UPDATE_INTERVAL = 10
 
 
+# Calendar days of price history fetched before the first simulated session.
+# The momentum path needs 200 trading bars for the Golden/Death Cross, which is
+# roughly 290 calendar days once weekends and holidays are removed.
+PRICE_WARMUP_CALENDAR_DAYS = 300
+
+
 def news_window_days(simulation_days: int, news_lookback_days: Optional[int] = None) -> int:
     """How many days of news to request.
 
@@ -365,7 +371,8 @@ class AlpacaBacktester:
         # Fetch price data with some buffer before start_date for technical indicators.
         # Injected frames are kept so offline runs do not open a client.
         if self.full_price_data is None or self.full_price_data.empty:
-            price_start = start_date - timedelta(days=200)  # Buffer for 200-day SMA
+            # 200 trading bars for the 200-day SMA need about 290 calendar days.
+            price_start = start_date - timedelta(days=PRICE_WARMUP_CALENDAR_DAYS)
             self.full_price_data = self.fetch_historical_data(price_start, end_date)
         
         # Fetch news data with historical end date. An empty list is a real
